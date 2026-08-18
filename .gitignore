@@ -1,1 +1,4 @@
 *.o
+direct.txt
+test/*_test
+test/*_disk_test
