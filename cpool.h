@@ -11,6 +11,12 @@ extern "C" {
 typedef uint64_t CHandle;
 
 /* ─── Configuration ────────────────────────────────────────── */
+/* Mode flags: 0 (default) = compress + evict (linked mode).
+ *   CPOOL_NO_COMPRESS : store blocks raw (swap-only mode)
+ *   CPOOL_NO_EVICT    : RAM-only (compression-only mode, no disk spill) */
+#define CPOOL_NO_COMPRESS (1u << 0)
+#define CPOOL_NO_EVICT    (1u << 1)
+
 typedef struct {
     size_t warm_limit;            /* max compressed RAM bytes */
     const char *file_path;        /* disk backing file (NULL=RAM only) */
@@ -18,6 +24,14 @@ typedef struct {
     int    compress_cores[8];     /* CPU affinity for compress workers */
     int    n_compress_cores;      /* 0=no pinning */
     int    batch_flush_size;      /* bytes to batch before disk flush */
+    unsigned flags;               /* CPOOL_NO_* bits; 0 = linked mode */
+
+    /* Optional custom backing backend (e.g. a cfs partition).
+     * When backend_open is set, file_path is ignored. */
+    int  (*backend_open)(void **ctx, uint64_t limit);
+    int  (*backend_write)(void *ctx, const void *data, size_t sz, uint64_t off);
+    int  (*backend_read)(void *ctx, void *data, size_t sz, uint64_t off);
+    void (*backend_close)(void *ctx);
 } CPoolConfig;
 
 /* ─── Opaque pool handle ───────────────────────────────────── */

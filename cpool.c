@@ -36,7 +36,8 @@ struct CPool {
     BlockMeta       blocks[MAX_BLOCKS];
     uint32_t        n_blocks;
     CPoolStats      st;
-    int             disk_fd;       /* disk backing file */
+    int             disk_fd;       /* disk backing file (-1 = backend mode) */
+    void           *backend_ctx;   /* custom backend context */
     uint64_t        disk_end;      /* next write position */
 };
 
@@ -73,10 +74,14 @@ static void *fl_alloc(struct CPool *p, size_t need, size_t *out_size) {
 
 /* ── Write compressed block to disk backing file ──────────────── */
 static int disk_write(struct CPool *p, void *data, size_t sz, uint64_t *out_off) {
-    if (p->disk_fd < 0) return -1;
     if (p->cfg.file_limit > 0 && p->disk_end + sz > p->cfg.file_limit) return -1;
     *out_off = p->disk_end;
-    if (pwrite(p->disk_fd, data, sz, (off_t)*out_off) != (ssize_t)sz) return -1;
+    if (p->cfg.backend_open) {
+        if (p->cfg.backend_write(p->backend_ctx, data, sz, p->disk_end) != 0) return -1;
+    } else {
+        if (p->disk_fd < 0) return -1;
+        if (pwrite(p->disk_fd, data, sz, (off_t)p->disk_end) != (ssize_t)sz) return -1;
+    }
     p->disk_end += sz;
     p->st.file_write_bytes += sz;
     return 0;
@@ -84,10 +89,14 @@ static int disk_write(struct CPool *p, void *data, size_t sz, uint64_t *out_off)
 
 /* ── Read compressed block from disk backing file ─────────────── */
 static void *disk_read(struct CPool *p, uint64_t off, size_t sz) {
-    if (p->disk_fd < 0) return NULL;
     void *buf = malloc(sz);
     if (!buf) return NULL;
-    if (pread(p->disk_fd, buf, sz, (off_t)off) != (ssize_t)sz) { free(buf); return NULL; }
+    if (p->cfg.backend_open) {
+        if (p->cfg.backend_read(p->backend_ctx, buf, sz, off) != 0) { free(buf); return NULL; }
+    } else {
+        if (p->disk_fd < 0) { free(buf); return NULL; }
+        if (pread(p->disk_fd, buf, sz, (off_t)off) != (ssize_t)sz) { free(buf); return NULL; }
+    }
     p->st.file_read_bytes += sz;
     return buf;
 }
@@ -104,8 +113,8 @@ static int evict_one(struct CPool *p) {
     if (idx<0) return 0;
     BlockMeta *b=&p->blocks[idx];
 
-    /* Spill to disk if backing file configured */
-    if (p->disk_fd >= 0) {
+    /* Spill to disk if backing configured (never in RAM-only mode) */
+    if (!(p->cfg.flags & CPOOL_NO_EVICT) && (p->cfg.backend_open || p->disk_fd >= 0)) {
         uint64_t off;
         if (disk_write(p, b->warm_ptr, b->warm_size, &off) == 0) {
             b->file_offset = off;
@@ -126,6 +135,8 @@ static int evict_one(struct CPool *p) {
 static int make_space(struct CPool *p, size_t need) {
     /* Try free list first */
     for (FlNode *n=p->free_head;n;n=n->next) if(n->size>=need) return 1;
+    /* RAM-only mode: never evict */
+    if (p->cfg.flags & CPOOL_NO_EVICT) return 0;
     /* Evict up to 8 blocks */
     for (int i=0;i<8;i++) {
         if(!evict_one(p)) break;
@@ -143,12 +154,20 @@ CPool *cpool_create(const CPoolConfig *cfg) {
     p->warm_buf=malloc(p->warm_capacity); if(!p->warm_buf){free(p);return NULL;}
     fl_insert(p,p->warm_buf,p->warm_capacity);
 
-    /* Open disk backing file if configured */
+    /* Open disk backing (custom backend takes precedence over file;
+     * RAM-only mode never touches disk) */
     p->disk_fd = -1;
-    if (p->cfg.file_path && p->cfg.file_path[0]) {
+    if (p->cfg.flags & CPOOL_NO_EVICT) {
+        /* no backing at all */
+    } else if (p->cfg.backend_open) {
+        if (p->cfg.backend_open(&p->backend_ctx, p->cfg.file_limit) != 0) {
+            free(p->warm_buf); free(p); return NULL;
+        }
+        p->disk_end = 0;
+    } else if (p->cfg.file_path && p->cfg.file_path[0]) {
         p->disk_fd = open(p->cfg.file_path, O_CREAT|O_RDWR|O_TRUNC, 0600);
         if (p->disk_fd < 0) { free(p->warm_buf); free(p); return NULL; }
-        /* Pre-allocate 1GB sparse to prevent ENOSPC surprises */
+        /* Pre-allocate sparse backing to prevent ENOSPC surprises */
         if (p->cfg.file_limit > 0)
             ftruncate(p->disk_fd, (off_t)p->cfg.file_limit);
         p->disk_end = 0;
@@ -162,7 +181,9 @@ void cpool_destroy(CPool *p) {
     if(!p) return;
     pthread_mutex_destroy(&p->lock);
     free(p->warm_buf);
-    if (p->disk_fd >= 0) {
+    if (p->cfg.backend_open) {
+        if (p->cfg.backend_close) p->cfg.backend_close(p->backend_ctx);
+    } else if (p->disk_fd >= 0) {
         close(p->disk_fd);
         if (p->cfg.file_path && p->cfg.file_path[0])
             unlink(p->cfg.file_path);
@@ -221,17 +242,21 @@ void *cpool_access(CPool *p, CHandle h) {
     if(!b->temp_buf){b->access_count--;pthread_mutex_unlock(&p->lock);return NULL;}
 
     if(b->tier==1 && b->warm_ptr){
-        /* Decompress from warm RAM */
+        /* Decompress (or raw-copy) from warm RAM */
         size_t ol=b->original_size;
-        if(cpenc_decompress(b->warm_ptr,b->warm_size,b->temp_buf,&ol)||ol!=b->original_size)
+        if (p->cfg.flags & CPOOL_NO_COMPRESS) {
+            memcpy(b->temp_buf, b->warm_ptr, b->original_size);
+        } else if(cpenc_decompress(b->warm_ptr,b->warm_size,b->temp_buf,&ol)||ol!=b->original_size)
             {free(b->temp_buf);b->temp_buf=NULL;b->access_count--;pthread_mutex_unlock(&p->lock);return NULL;}
         p->st.decompress_count++;
     } else if(b->tier==2 && b->file_size>0){
-        /* Read from disk, decompress */
+        /* Read from disk, decompress (or raw-copy) */
         void *disk_buf = disk_read(p, b->file_offset, b->file_size);
         if(!disk_buf){free(b->temp_buf);b->temp_buf=NULL;b->access_count--;pthread_mutex_unlock(&p->lock);return NULL;}
         size_t ol=b->original_size;
-        if(cpenc_decompress(disk_buf,b->file_size,b->temp_buf,&ol)||ol!=b->original_size)
+        if (p->cfg.flags & CPOOL_NO_COMPRESS) {
+            memcpy(b->temp_buf, disk_buf, b->original_size);
+        } else if(cpenc_decompress(disk_buf,b->file_size,b->temp_buf,&ol)||ol!=b->original_size)
             {free(disk_buf);free(b->temp_buf);b->temp_buf=NULL;b->access_count--;pthread_mutex_unlock(&p->lock);return NULL;}
         free(disk_buf);
         p->st.decompress_count++;
@@ -254,11 +279,21 @@ void cpool_release(CPool *p, CHandle h) {
     b->access_count--;
     if(b->access_count>0||!b->temp_buf){pthread_mutex_unlock(&p->lock);return;}
 
-    size_t mc=cpenc_max_compressed_size(b->original_size);
-    uint8_t *comp=malloc(mc); if(!comp){pthread_mutex_unlock(&p->lock);return;}
-    size_t cl=mc;
-    if(cpenc_compress(b->temp_buf,b->original_size,comp,&cl,2))
-        {free(comp);pthread_mutex_unlock(&p->lock);return;}
+    /* Compress (or raw-copy in NO_COMPRESS mode) */
+    size_t cl;
+    uint8_t *comp;
+    if (p->cfg.flags & CPOOL_NO_COMPRESS) {
+        cl = b->original_size;
+        comp = malloc(cl);
+        if(!comp){pthread_mutex_unlock(&p->lock);return;}
+        memcpy(comp, b->temp_buf, cl);
+    } else {
+        size_t mc=cpenc_max_compressed_size(b->original_size);
+        comp=malloc(mc); if(!comp){pthread_mutex_unlock(&p->lock);return;}
+        cl=mc;
+        if(cpenc_compress(b->temp_buf,b->original_size,comp,&cl,2))
+            {free(comp);pthread_mutex_unlock(&p->lock);return;}
+    }
 
     /* Free old warm storage */
     if(b->warm_ptr){p->st.warm_used-=b->warm_size;p->st.warm_uncompressed-=b->original_size;
@@ -266,10 +301,11 @@ void cpool_release(CPool *p, CHandle h) {
 
     /* Try to allocate warm space; if not, evict */
     if(!make_space(p,cl)){
-        for(int i=0;i<32;i++){evict_one(p);if(make_space(p,cl))break;}
+        for(int i=0;i<32;i++){if (p->cfg.flags & CPOOL_NO_EVICT) break; evict_one(p);if(make_space(p,cl))break;}
         if(!make_space(p,cl)){
-            /* Cannot fit in warm RAM — store to disk directly */
-            if(p->disk_fd>=0){
+            /* Cannot fit in warm RAM — store to disk directly (never in
+             * RAM-only mode: the block stays resident in temp_buf) */
+            if(!(p->cfg.flags & CPOOL_NO_EVICT) && (p->cfg.backend_open || p->disk_fd>=0)){
                 uint64_t off;
                 if(disk_write(p,comp,cl,&off)==0){
                     b->file_offset=off;b->file_size=cl;b->tier=2;
