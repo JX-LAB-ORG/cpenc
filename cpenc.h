@@ -9,7 +9,7 @@ extern "C" {
 
 /* ─── CPEnc block header (12 + stride bytes) ─────────────────── */
 #define CPENC_MAGIC   0x4350   /* 'CP' */
-#define CPENC_VERSION 1
+#define CPENC_VERSION 2        /* v2: stride remainder bytes stored in stream */
 #define CPENC_STRIDE_RAW 0xFF  /* RAW passthrough stride */
 
 typedef struct {

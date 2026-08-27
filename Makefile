@@ -11,10 +11,10 @@ cpool.o: cpool.c cpool.h cpenc.h
 	cc $(CFLAGS) -c cpool.c -o cpool.o
 
 libcpool_hook.o: libcpool_hook.c cpool.h
-	cc -std=gnu11 $(CFLAGS) -fPIC -c libcpool_hook.c -o libcpool_hook.o
+	cc $(CFLAGS) -std=gnu11 -fPIC -c libcpool_hook.c -o libcpool_hook.o
 
 libcpool_hook.so: cpenc.o cpool.o libcpool_hook.o
-	cc -std=gnu11 $(CFLAGS) -shared -fPIC -o $@ $^ -lpthread -ldl
+	cc $(CFLAGS) -std=gnu11 -shared -fPIC -o $@ $^ -lpthread -ldl
 
 test: cpenc.o cpool.o test/cpenc_test.c test/cpool_test.c test/cpool_disk_test.c
 	cc $(CFLAGS) test/cpenc_test.c cpenc.o -lm -o test/cpenc_test

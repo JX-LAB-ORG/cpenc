@@ -331,6 +331,17 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
     }
 
     h->magic=CPENC_MAGIC;h->version=CPENC_VERSION;h->stride=(uint8_t)stride;
+    /* v2: store the stride remainder (tail bytes not covered by any group)
+     * so decompress can restore them exactly */
+    {
+        size_t gend = gs * (size_t)stride;
+        if (gend < sl) {
+            size_t rem = sl - gend;
+            if ((size_t)(edd - out) < rem) { free(trial); free(trans); return -1; }
+            memcpy(out, trans + gend, rem);
+            out += rem;
+        }
+    }
     h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(out-(d+CPENC_HEADER_SIZE));
     *dl=(size_t)(out-d); free(trial); free(trans); return 0;
 }
@@ -417,6 +428,16 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             }
         }else{
             if(h_dec(&p,edd,gp,gs)<0){if(stride>1)free(trans);return-1;}
+        }
+    }
+    /* v2: read the stride remainder tail bytes (never delta-coded) */
+    if (h->version >= 2) {
+        size_t gend = gs * (size_t)stride;
+        if (orig > gend) {
+            size_t rem = orig - gend;
+            if ((size_t)(edd - p) < rem) { if (stride > 1) free(trans); return -1; }
+            memcpy(trans + gend, p, rem);
+            p += rem;
         }
     }
     for(int g=0;g<stride;g++) dd(trans+g*gs,gs,orders[g]);
