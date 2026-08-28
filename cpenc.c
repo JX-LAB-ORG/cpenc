@@ -283,7 +283,10 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
         else if(nz<=32){
             int bits=1;while((1<<bits)<nz&&bits<HUFF_MAX)bits++;
             size_t sz_l=6+(size_t)nz+gs*(size_t)bits/8+5;
+            /* nz<=32 with skewed frequencies (text: nz~30, ent~3.9) loses
+             * 0.5-1 bit/symbol to fixed-width LUT — always compare Huffman */
             tag = sz_l<sz_raw ? 1 : 3;
+            if(sz_h<sz_l && sz_h<sz_raw) tag=2;
         }
         else{tag=sz_h<sz_raw?2:3;}
 
