@@ -2,3 +2,5 @@
 direct.txt
 test/*_test
 test/*_disk_test
+libcpool_hook.so
+test/cpenc_bench
