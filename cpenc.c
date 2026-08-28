@@ -108,9 +108,14 @@ static void hlens(uint32_t fq[256],uint8_t lens[256]){
     int root=heap[0].sym,q[512],qh=0,qt=0,depth[512];
     memset(depth,0,sizeof(depth));
     q[qt++]=root; depth[root]=0;
-    while(qh<qt){int v=q[qh++],d=depth[v]+1;
-        if(v>=256){if(left[v]>=0){depth[left[v]]=d;q[qt++]=left[v];}if(right[v]>=0){depth[right[v]]=d;q[qt++]=right[v];}}
-        else{depth[v]=d;}
+    /* Leaf depths are set here from their parent's depth; re-visiting a
+     * leaf in the BFS would recompute d = depth[v]+1 and add 1 to every
+     * symbol's code length (a long-standing -1 bit/symbol penalty). */
+    while(qh<qt){int v=q[qh++];
+        if(v>=256){int d=depth[v]+1;
+            if(left[v]>=0){depth[left[v]]=d;q[qt++]=left[v];}
+            if(right[v]>=0){depth[right[v]]=d;q[qt++]=right[v];}
+        }
     }
     /* Length-limited adjustment (JPEG Annex K.3 style).  Clamping deep
      * leaves to HUFF_MAX would collide canonical codes; instead count
@@ -194,10 +199,40 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
     /* Tiny inputs: the stride/group machinery breaks down (gs can be 0)
      * and compression gains are nil — store RAW, always safe to decode. */
     if(sl<64){
-        if(*dl<CPENC_HEADER_SIZE+sl) return -1;
+        if(*dl<CPENC_HEADER_SIZE+1+sl) return -1;
         h->magic=CPENC_MAGIC;h->version=CPENC_VERSION;h->stride=CPENC_STRIDE_RAW;
-        h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)sl;
-        memcpy(d+CPENC_HEADER_SIZE,s,sl);*dl=CPENC_HEADER_SIZE+sl;return 0;
+        h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(1+sl);
+        d[CPENC_HEADER_SIZE]=CPENC_LAG_NONE;
+        memcpy(d+CPENC_HEADER_SIZE+1,s,sl);*dl=CPENC_HEADER_SIZE+1+sl;return 0;
+    }
+
+    /* v3: lag-delta preprocessing — catches fixed-frame periodicity
+     * (log rows, protocol frames, config tables).  Pure O(1) arithmetic,
+     * no search.  Dense lag scan 16..255 with sampling entropy picks any
+     * real frame length; ~240 x 4KB sampling ≈ a few ms per 64MB block. */
+    int lag_idx = CPENC_LAG_NONE;
+    uint8_t *lagbuf = NULL;
+    if (sl >= 4096) {
+        size_t k = sl < 8192 ? sl : 8192;
+        double best_e = ent(s, k);
+        uint8_t *t = malloc(k);
+        if (t) {
+            for (int p = CPENC_LAG_MIN; p <= CPENC_LAG_MAX; p++) {
+                if (p >= (int)k) break;
+                for (size_t i = 0; i < k; i++)
+                    t[i] = (uint8_t)(s[i] - (i >= (size_t)p ? s[i - (size_t)p] : 0));
+                double e = ent(t, k);
+                if (e < best_e - 0.05) { best_e = e; lag_idx = p; }
+            }
+            free(t);
+        }
+    }
+    if (lag_idx) {
+        lagbuf = malloc(sl);
+        if (!lagbuf) return -2;
+        for (size_t i = 0; i < sl; i++)
+            lagbuf[i] = (uint8_t)(s[i] - (i >= (size_t)lag_idx ? s[i - (size_t)lag_idx] : 0));
+        s = lagbuf;
     }
 
     int stride=ds(s,sl);
@@ -227,7 +262,7 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
     }
 
     size_t gs=sl/(size_t)stride;
-    uint8_t *trans = malloc(sl); if(!trans) return -2;
+    uint8_t *trans = malloc(sl); if(!trans){free(lagbuf);return -2;}
     uint8_t *trial = malloc(4096); if(!trial){free(trans);return-2;}
 
     if(stride==1){memcpy(trans,s,sl);}
@@ -258,15 +293,17 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
      * failed delta — a single-group stride=1 with high entropy may
      * still benefit from Huffman/LUT. Let per-group tag selection decide. */
     if(nraw==stride && stride>1 && sl>=256){
-        if(*dl<CPENC_HEADER_SIZE+sl){free(trial);free(trans);return-1;}
+        if(*dl<CPENC_HEADER_SIZE+1+sl){free(trial);free(trans);free(lagbuf);return-1;}
         h->magic=CPENC_MAGIC;h->version=CPENC_VERSION;h->stride=CPENC_STRIDE_RAW;
-        h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)sl;
-        memcpy(d+CPENC_HEADER_SIZE,s,sl);*dl=CPENC_HEADER_SIZE+sl;
-        free(trial);free(trans);return 0;
+        h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(1+sl);
+        d[CPENC_HEADER_SIZE]=(uint8_t)lag_idx;
+        memcpy(d+CPENC_HEADER_SIZE+1,s,sl);*dl=CPENC_HEADER_SIZE+1+sl;
+        free(trial);free(trans);free(lagbuf);return 0;
     }
 
     uint8_t *out=d+CPENC_HEADER_SIZE,*edd=d+*dl;
-    for(int g=0;g<stride;g++){if(out>=edd){free(trial);free(trans);return-1;}*out++=orders[g];}
+    if(out>=edd){free(trial);free(trans);free(lagbuf);return-1;} *out++=(uint8_t)lag_idx;
+    for(int g=0;g<stride;g++){if(out>=edd){free(trial);free(trans);free(lagbuf);return-1;}*out++=orders[g];}
 
     for(int g=0;g<stride;g++){
         uint8_t *gp = trans + (size_t)g*gs;
@@ -290,10 +327,10 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
         }
         else{tag=sz_h<sz_raw?2:3;}
 
-        if(out>=edd){free(trial);free(trans);return-1;} *out++=tag;
+        if(out>=edd){free(trial);free(trans);free(lagbuf);return-1;} *out++=tag;
         if(tag==0){
             uint8_t val=0;for(int i=0;i<256;i++)if(fq[i]){val=(uint8_t)i;break;}
-            if(out+6>edd){free(trial);free(trans);return-1;}
+            if(out+6>edd){free(trial);free(trans);free(lagbuf);return-1;}
             *out++=gs&0xFF;*out++=(gs>>8)&0xFF;*out++=(gs>>16)&0xFF;*out++=gs>>24;
             *out++=val;*out++=(uint8_t)(nz-1);
         }else if(tag==1){
@@ -301,7 +338,7 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
             uint8_t lut[32],rev[256]={0};int li=0;
             for(int i=0;i<256&&li<nz;i++)if(fq[i]){uint8_t v=(uint8_t)i;lut[li]=v;rev[v]=(uint8_t)li;li++;}
             size_t need=6+(size_t)nz+gs*(size_t)bits/8+1;
-            if((size_t)(edd-out)<need){free(trial);free(trans);return-1;}
+            if((size_t)(edd-out)<need){free(trial);free(trans);free(lagbuf);return-1;}
             *out++=gs&0xFF;*out++=(gs>>8)&0xFF;*out++=(gs>>16)&0xFF;*out++=gs>>24;
             *out++=(uint8_t)(nz-1);
             for(int i=0;i<nz;i++)*out++=lut[i];
@@ -327,10 +364,10 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
             uint8_t lens[256];uint16_t code[256];uint8_t bits[256];
             hlens(fq,lens);hcodes(lens,code,bits);
             uint32_t used=h_enc(gp,gs,lens,code,bits,out,(size_t)(edd-out));
-            if(used==0||(size_t)(edd-out)<used){free(trial);free(trans);return-1;}
+            if(used==0||(size_t)(edd-out)<used){free(trial);free(trans);free(lagbuf);return-1;}
             out+=used;
         }else{
-            if((size_t)(edd-out)<4+gs){free(trial);free(trans);return-1;}
+            if((size_t)(edd-out)<4+gs){free(trial);free(trans);free(lagbuf);return-1;}
             *out++=gs&0xFF;*out++=(gs>>8)&0xFF;*out++=(gs>>16)&0xFF;*out++=gs>>24;
             memcpy(out,gp,gs);out+=gs;
         }
@@ -362,12 +399,24 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
     if(h->stride==CPENC_STRIDE_RAW){
         if(h->original_size==0){*dl=0;return 0;}
         if(*dl<h->original_size) return -1;
-        memcpy(d,s+CPENC_HEADER_SIZE,h->original_size);*dl=h->original_size;return 0;}
+        const uint8_t *rp = s+CPENC_HEADER_SIZE;
+        int lag_idx = CPENC_LAG_NONE;
+        if(h->version>=3){
+            if(sl<CPENC_HEADER_SIZE+1+(size_t)h->original_size) return -1;
+            lag_idx=*rp++;
+        } else if((size_t)(sl-CPENC_HEADER_SIZE)<(size_t)h->original_size) return -1;
+        memcpy(d,rp,h->original_size);
+        if(lag_idx){
+            for(size_t i=(size_t)lag_idx;i<h->original_size;i++) d[i]+=d[i-(size_t)lag_idx];
+        }
+        *dl=h->original_size;return 0;}
 
     int stride=(int)h->stride; if(stride<1||stride>8) return -1;
     size_t orig=h->original_size, gs=orig/(size_t)stride;
     if(*dl<orig) return -1;
     const uint8_t *p=s+CPENC_HEADER_SIZE, *edd=s+sl;
+    int lag_idx = CPENC_LAG_NONE;
+    if(h->version>=3){ if(p>=edd)return-1; lag_idx=*p++; }
     uint8_t orders[8];
     for(int g=0;g<stride;g++){if(p>=edd)return-1;orders[g]=*p++;}
 
@@ -450,5 +499,9 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
     }
     for(int g=0;g<stride;g++) dd(trans+g*gs,gs,orders[g]);
     if(stride>1){ur(trans,d,orig,stride);free(trans);}
+    /* v3: undo lag-delta (applied pre-transpose on the raw byte order) */
+    if(lag_idx){
+        for(size_t i=(size_t)lag_idx;i<orig;i++) d[i]+=d[i-(size_t)lag_idx];
+    }
     *dl=orig; return 0;
 }
