@@ -1,6 +1,7 @@
 #include "cpenc.h"
 #include <string.h>
 #include <stdlib.h>
+#include <unistd.h>
 #include <math.h>
 #include <stdio.h>
 
@@ -197,16 +198,20 @@ static uint32_t h_enc_seg(const uint8_t *d, size_t n, uint8_t *ob, size_t cap) {
 }
 #include <pthread.h>
 typedef struct {
-    const uint8_t *data;   /* segment start */
-    const uint8_t *end;    /* segment end */
-    uint8_t *dst;
-    size_t n;
+    const uint8_t *data[2];  /* segment starts */
+    const uint8_t *end[2];   /* segment ends */
+    uint8_t *dst[2];
+    size_t n[2];
     int rc;
 } SegJob;
 static void *seg_worker(void *arg) {
     SegJob *j = (SegJob *)arg;
-    const uint8_t *seg = j->data;
-    j->rc = h_dec(&seg, j->end, j->dst, j->n);
+    j->rc = 0;
+    for (int k = 0; k < 2; k++) {
+        if (!j->n[k]) continue;
+        const uint8_t *seg = j->data[k];
+        if (h_dec(&seg, j->end[k], j->dst[k], j->n[k])) { j->rc = -1; break; }
+    }
     return NULL;
 }
 static int h_dec_seg(const uint8_t **sp, const uint8_t *end, uint8_t *dst, size_t n) {
@@ -220,31 +225,91 @@ static int h_dec_seg(const uint8_t **sp, const uint8_t *end, uint8_t *dst, size_
                   ((uint32_t)src[4*k+2] << 16) | ((uint32_t)src[4*k+3] << 24);
     src += 4*HUFF_SEGS;
     size_t segn = (n + HUFF_SEGS - 1) / HUFF_SEGS;
-    SegJob jobs[HUFF_SEGS];
     const uint8_t *segp[HUFF_SEGS];
     segp[0] = src;
     for (int k = 1; k < HUFF_SEGS; k++) segp[k] = segp[k-1] + lens[k-1];
     if ((size_t)(end - segp[HUFF_SEGS-1]) < lens[HUFF_SEGS-1]) return -1;
-    pthread_t th[HUFF_SEGS];
-    int nthreads = 0;
+    /* 2 workers x 2 segments, segments independent.  Threads are the
+     * default (real hardware scales ~linearly); CPENC_NO_THREADS=1 falls
+     * back to sequential where thread scheduling misbehaves (PRoot). */
+    SegJob jobs[2];
+    pthread_t th[2];
     for (int k = 0; k < HUFF_SEGS; k++) {
         size_t off = (size_t)k * segn;
         size_t ln = (off + segn <= n) ? segn : n - off;
-        if (!ln) continue;
-        jobs[k].data = segp[k];
-        jobs[k].end = segp[k] + lens[k];
-        jobs[k].dst = dst + off;
-        jobs[k].n = ln;
-        jobs[k].rc = 0;
-        if (pthread_create(&th[nthreads++], NULL, seg_worker, &jobs[k]) != 0)
-            return -1;
+        int w = k / 2, s = k % 2;
+        jobs[w].data[s] = segp[k];
+        jobs[w].end[s] = segp[k] + lens[k];
+        jobs[w].dst[s] = dst + off;
+        jobs[w].n[s] = ln;
+        jobs[w].rc = 0;
     }
-    for (int i = 0; i < nthreads; i++) pthread_join(th[i], NULL);
-    for (int k = 0; k < HUFF_SEGS; k++) if (jobs[k].rc) return -1;
+    if (getenv("CPENC_NO_THREADS")) {
+        for (int w = 0; w < 2; w++) {
+            const uint8_t *s0 = jobs[w].data[0];
+            if (jobs[w].n[0] && h_dec(&s0, jobs[w].end[0], jobs[w].dst[0], jobs[w].n[0])) return -1;
+            const uint8_t *s1 = jobs[w].data[1];
+            if (jobs[w].n[1] && h_dec(&s1, jobs[w].end[1], jobs[w].dst[1], jobs[w].n[1])) return -1;
+        }
+    } else {
+        if (pthread_create(&th[0], NULL, seg_worker, &jobs[0]) != 0) return -1;
+        if (pthread_create(&th[1], NULL, seg_worker, &jobs[1]) != 0) return -1;
+        pthread_join(th[0], NULL);
+        pthread_join(th[1], NULL);
+        if (jobs[0].rc || jobs[1].rc) return -1;
+    }
     *sp = segp[HUFF_SEGS-1] + lens[HUFF_SEGS-1];
     return 0;
 }
 
+static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n);
+static int h_dec_p(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n,int prefix){
+    const uint8_t *src=*sp;if((size_t)(end-src)<264)return-1;
+    uint8_t lens[256];for(int i=0;i<256;i++)lens[i]=src[i];
+    uint32_t ul=(uint32_t)src[256]|((uint32_t)src[257]<<8)|((uint32_t)src[258]<<16)|((uint32_t)src[259]<<24);
+    uint32_t bsl=(uint32_t)src[260]|((uint32_t)src[261]<<8)|((uint32_t)src[262]<<16)|((uint32_t)src[263]<<24);
+    if(bsl > (uint32_t)(end-src)-264) return -1;
+    src+=264;const uint8_t *bse=src+bsl;
+    uint16_t code[256];uint8_t bits[256];hcodes(lens,code,bits);
+    uint16_t fast[HUFF_TABSZ];memset(fast,0,sizeof(fast));
+    for(int s=0;s<256;s++){if(lens[s]&&lens[s]<=HUFF_MAX){uint16_t c=code[s];int b=lens[s];
+        int xm=1<<(HUFF_MAX-b);
+        uint16_t v=(uint16_t)(((uint32_t)b<<8)|s);
+        for(int x=0;x<xm;x++){uint32_t fi=((uint32_t)c<<(HUFF_MAX-b))|(uint32_t)x;if(fi<HUFF_TABSZ)fast[fi]=v;}}}
+    size_t tgt=ul<n?ul:n;uint64_t buf=0;int cnt=0;
+    for(size_t dc=0;dc<tgt;){
+        while(cnt<HUFF_MAX&&src<bse){buf=(buf<<8)|(*src++);cnt+=8;}
+        if(cnt<HUFF_MAX){buf<<=(HUFF_MAX-cnt);cnt=HUFF_MAX;}
+        uint16_t v=fast[(buf>>(cnt-HUFF_MAX))&(HUFF_WSZ-1)];
+        if(!(v>>8)) return -1;
+        if((v>>8)==1){
+            uint8_t s1=(uint8_t)fast[0];  /* code=0 1-bit symbol (not v: v may be the code=1 one) */
+            uint16_t v2=fast[HUFF_WSZ/2];
+            uint8_t s2=(uint8_t)v2;
+            int s2len=v2>>8;
+            for(;;){
+                if(cnt<=1){
+                    if(src<bse){buf=(buf<<8)|(*src++);cnt+=8;}
+                    else{buf<<=(HUFF_MAX-cnt);cnt=HUFF_MAX;break;}
+                }
+                if((buf>>(cnt-1))&1){
+                    if(s2len!=1) break;
+                    dst[dc]=(uint8_t)((uint16_t)s2+(dc?(uint16_t)dst[dc-1]:0));
+                    dc++;cnt-=1;
+                    if(dc>=tgt)break;
+                    continue;
+                }
+                dst[dc]=(uint8_t)((uint16_t)s1+(dc?(uint16_t)dst[dc-1]:0));
+                dc++;cnt-=1;
+                if(dc>=tgt)break;
+            }
+            continue;
+        }
+        dst[dc]=(uint8_t)((uint16_t)v+(dc?(uint16_t)dst[dc-1]:0));
+        cnt-=(v>>8);dc++;
+    }
+    *sp=bse;return 0;
+}
 static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n){
     const uint8_t *src=*sp;if((size_t)(end-src)<264)return-1;
     uint8_t lens[256];for(int i=0;i<256;i++)lens[i]=src[i];
@@ -263,11 +328,39 @@ static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n){
         uint16_t v=(uint16_t)(((uint32_t)b<<8)|s);
         for(int x=0;x<xm;x++){uint32_t fi=((uint32_t)c<<(HUFF_MAX-b))|(uint32_t)x;if(fi<HUFF_TABSZ)fast[fi]=v;}}}
     size_t tgt=ul<n?ul:n;uint64_t buf=0;int cnt=0;
-    for(size_t dc=0;dc<tgt;dc++){while(cnt<HUFF_MAX&&src<bse){buf=(buf<<8)|(*src++);cnt+=8;}
+    for(size_t dc=0;dc<tgt;){
+        while(cnt<HUFF_MAX&&src<bse){buf=(buf<<8)|(*src++);cnt+=8;}
         if(cnt<HUFF_MAX){buf<<=(HUFF_MAX-cnt);cnt=HUFF_MAX;}
         uint16_t v=fast[(buf>>(cnt-HUFF_MAX))&(HUFF_WSZ-1)];
         if(!(v>>8)) return -1;
+        /* fast path: canonical 1-bit codes (top bit 0) — skewed streams
+         * like FP4 deltas are dominated by one symbol; consume runs of it
+         * at ~2 ops/symbol instead of the full table lookup */
+        if((v>>8)==1){
+            uint8_t s1=(uint8_t)fast[0];  /* code=0 1-bit symbol (not v: v may be the code=1 one) */
+            uint16_t v2=fast[HUFF_WSZ/2];
+            uint8_t s2=(uint8_t)v2;
+            int s2len=v2>>8;
+            for(;;){
+                if(cnt<=1){
+                    if(src<bse){buf=(buf<<8)|(*src++);cnt+=8;}
+                    else{buf<<=(HUFF_MAX-cnt);cnt=HUFF_MAX;break;}
+                }
+                if((buf>>(cnt-1))&1){
+                    /* other symbol: 1-bit only if it really is; longer
+                     * codes go to the slow path (which won't bounce back) */
+                    if(s2len!=1) break;
+                    dst[dc++]=s2;cnt-=1;
+                    if(dc>=tgt)break;
+                    continue;
+                }
+                dst[dc++]=s1;cnt-=1;
+                if(dc>=tgt)break;
+            }
+            continue;
+        }
         dst[dc]=(uint8_t)v;cnt-=(v>>8);
+        dc++;
     }
     *sp=bse;return 0;
 }
@@ -582,8 +675,10 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             }
         }else{
             int hrc;
-            if(gs >= (1u<<20)) hrc = h_dec_seg(&p,edd,gp,gs);
-            else               hrc = h_dec(&p,edd,gp,gs);
+            if(stride==1 && orders[g]==1 && lag_idx==0)
+                hrc = h_dec_p(&p,edd,gp,gs,1);       /* fused prefix sum */
+            else if(gs >= (1u<<20)) hrc = h_dec_seg(&p,edd,gp,gs);
+            else                     hrc = h_dec(&p,edd,gp,gs);
             if(hrc<0){if(stride>1)free(trans);return-1;}
         }
     }
