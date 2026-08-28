@@ -156,6 +156,9 @@ static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n){
     uint8_t lens[256];for(int i=0;i<256;i++)lens[i]=src[i];
     uint32_t ul=(uint32_t)src[256]|((uint32_t)src[257]<<8)|((uint32_t)src[258]<<16)|((uint32_t)src[259]<<24);
     uint32_t bsl=(uint32_t)src[260]|((uint32_t)src[261]<<8)|((uint32_t)src[262]<<16)|((uint32_t)src[263]<<24);
+    /* bsl comes from the stream: reject out-of-range before any pointer
+     * arithmetic, or a corrupted block reads past the input buffer */
+    if(bsl > (uint32_t)(end-src)-264) return -1;
     src+=264;const uint8_t *bse=src+bsl;
     uint16_t code[256];uint8_t bits[256];hcodes(lens,code,bits);
     uint8_t fast[HUFF_TABSZ];memset(fast,0,sizeof(fast));
@@ -350,7 +353,9 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
     const uint8_t *s=(const uint8_t*)sv; uint8_t *d=(uint8_t*)dv;
     const CPEncHeader *h=(const CPEncHeader*)s;
     if(sl<CPENC_HEADER_SIZE) return -1;
-    if(h->magic!=CPENC_MAGIC||h->version!=CPENC_VERSION) return -1;
+    /* v1 blocks (no stride remainder) remain decodable; reject only
+     * unknown versions and garbage magic */
+    if(h->magic!=CPENC_MAGIC||h->version<1||h->version>CPENC_VERSION) return -1;
     if(h->stride==CPENC_STRIDE_RAW){
         if(h->original_size==0){*dl=0;return 0;}
         if(*dl<h->original_size) return -1;
