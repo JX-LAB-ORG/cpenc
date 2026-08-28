@@ -156,6 +156,95 @@ static uint32_t h_enc(const uint8_t *d,size_t n,const uint8_t lens[256],const ui
     uint32_t bsl=(uint32_t)(op-bst);ob[260]=bsl&0xFF;ob[261]=(bsl>>8)&0xFF;ob[262]=(bsl>>16)&0xFF;ob[263]=bsl>>24;
     return (uint32_t)(op-ob);
 }
+
+static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n);
+/* Segmented Huffman: split the symbol stream into SEGS independent
+ * Huffman blocks (own table each).  Header: [SEGS][SEGS x u32 len].  Lets
+ * the decoder run segments in parallel; table overhead ~SEGS*264B. */
+#define HUFF_SEGS 4
+static uint32_t h_enc_seg(const uint8_t *d, size_t n, uint8_t *ob, size_t cap) {
+    if (cap < 1 + 4*HUFF_SEGS + 264u + n) return 0;
+    size_t segn = (n + HUFF_SEGS - 1) / HUFF_SEGS;
+    uint8_t *lp = ob;
+    *lp++ = HUFF_SEGS;
+    uint8_t *lens_out = lp;                       /* lengths, patched later */
+    memset(lens_out, 0, 4*HUFF_SEGS);
+    lp += 4*HUFF_SEGS;
+    uint32_t total = 0;
+    for (int k = 0; k < HUFF_SEGS; k++) {
+        size_t off = (size_t)k * segn;
+        size_t ln = (off + segn <= n) ? segn : n - off;
+        if (!ln) { lens_out[k] = 0; continue; }
+        uint32_t fq[256];
+        freq256(d + off, ln, fq);
+        uint8_t lens[256]; uint16_t code[256]; uint8_t bits[256];
+        hlens(fq, lens); hcodes(lens, code, bits);
+        uint32_t used = h_enc(d + off, ln, lens, code, bits, lp, cap - (size_t)(lp - ob));
+        if (!used) return 0;
+        lens_out[4*k+0] = (uint8_t)used;
+        lens_out[4*k+1] = (uint8_t)(used >> 8);
+        lens_out[4*k+2] = (uint8_t)(used >> 16);
+        lens_out[4*k+3] = (uint8_t)(used >> 24);
+        lp += used;
+        total += used;
+    }
+    for (int k = 0; k < HUFF_SEGS; k++) {
+        size_t off = (size_t)k * segn;
+        size_t ln = (off + segn <= n) ? segn : n - off;
+        (void)ln;
+    }
+    return (uint32_t)(lp - ob);
+}
+#include <pthread.h>
+typedef struct {
+    const uint8_t *data;   /* segment start */
+    const uint8_t *end;    /* segment end */
+    uint8_t *dst;
+    size_t n;
+    int rc;
+} SegJob;
+static void *seg_worker(void *arg) {
+    SegJob *j = (SegJob *)arg;
+    const uint8_t *seg = j->data;
+    j->rc = h_dec(&seg, j->end, j->dst, j->n);
+    return NULL;
+}
+static int h_dec_seg(const uint8_t **sp, const uint8_t *end, uint8_t *dst, size_t n) {
+    const uint8_t *src = *sp;
+    if ((size_t)(end - src) < 1 + 4*HUFF_SEGS) return -1;
+    int segs = *src++;
+    if (segs != HUFF_SEGS) return -1;
+    uint32_t lens[4];
+    for (int k = 0; k < HUFF_SEGS; k++)
+        lens[k] = (uint32_t)src[4*k] | ((uint32_t)src[4*k+1] << 8) |
+                  ((uint32_t)src[4*k+2] << 16) | ((uint32_t)src[4*k+3] << 24);
+    src += 4*HUFF_SEGS;
+    size_t segn = (n + HUFF_SEGS - 1) / HUFF_SEGS;
+    SegJob jobs[HUFF_SEGS];
+    const uint8_t *segp[HUFF_SEGS];
+    segp[0] = src;
+    for (int k = 1; k < HUFF_SEGS; k++) segp[k] = segp[k-1] + lens[k-1];
+    if ((size_t)(end - segp[HUFF_SEGS-1]) < lens[HUFF_SEGS-1]) return -1;
+    pthread_t th[HUFF_SEGS];
+    int nthreads = 0;
+    for (int k = 0; k < HUFF_SEGS; k++) {
+        size_t off = (size_t)k * segn;
+        size_t ln = (off + segn <= n) ? segn : n - off;
+        if (!ln) continue;
+        jobs[k].data = segp[k];
+        jobs[k].end = segp[k] + lens[k];
+        jobs[k].dst = dst + off;
+        jobs[k].n = ln;
+        jobs[k].rc = 0;
+        if (pthread_create(&th[nthreads++], NULL, seg_worker, &jobs[k]) != 0)
+            return -1;
+    }
+    for (int i = 0; i < nthreads; i++) pthread_join(th[i], NULL);
+    for (int k = 0; k < HUFF_SEGS; k++) if (jobs[k].rc) return -1;
+    *sp = segp[HUFF_SEGS-1] + lens[HUFF_SEGS-1];
+    return 0;
+}
+
 static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n){
     const uint8_t *src=*sp;if((size_t)(end-src)<264)return-1;
     uint8_t lens[256];for(int i=0;i<256;i++)lens[i]=src[i];
@@ -166,16 +255,19 @@ static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n){
     if(bsl > (uint32_t)(end-src)-264) return -1;
     src+=264;const uint8_t *bse=src+bsl;
     uint16_t code[256];uint8_t bits[256];hcodes(lens,code,bits);
-    uint8_t fast[HUFF_TABSZ];memset(fast,0,sizeof(fast));
+    /* fast table: high byte = code length, low byte = symbol — one lookup
+     * yields both, avoiding the second lens[] access per symbol */
+    uint16_t fast[HUFF_TABSZ];memset(fast,0,sizeof(fast));
     for(int s=0;s<256;s++){if(lens[s]&&lens[s]<=HUFF_MAX){uint16_t c=code[s];int b=lens[s];
         int xm=1<<(HUFF_MAX-b);
-        for(int x=0;x<xm;x++){uint32_t fi=((uint32_t)c<<(HUFF_MAX-b))|(uint32_t)x;if(fi<HUFF_TABSZ)fast[fi]=(uint8_t)s;}}}
+        uint16_t v=(uint16_t)(((uint32_t)b<<8)|s);
+        for(int x=0;x<xm;x++){uint32_t fi=((uint32_t)c<<(HUFF_MAX-b))|(uint32_t)x;if(fi<HUFF_TABSZ)fast[fi]=v;}}}
     size_t tgt=ul<n?ul:n;uint64_t buf=0;int cnt=0;
     for(size_t dc=0;dc<tgt;dc++){while(cnt<HUFF_MAX&&src<bse){buf=(buf<<8)|(*src++);cnt+=8;}
         if(cnt<HUFF_MAX){buf<<=(HUFF_MAX-cnt);cnt=HUFF_MAX;}
-        uint32_t idx=(uint32_t)((buf>>(cnt-HUFF_MAX))&(HUFF_WSZ-1));uint8_t s=fast[idx];
-        if(lens[s]==0) return -1;
-        dst[dc]=s; cnt-=lens[s];
+        uint16_t v=fast[(buf>>(cnt-HUFF_MAX))&(HUFF_WSZ-1)];
+        if(!(v>>8)) return -1;
+        dst[dc]=(uint8_t)v;cnt-=(v>>8);
     }
     *sp=bse;return 0;
 }
@@ -361,9 +453,14 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                 while(enc_bc>=8){*out++=(uint8_t)(enc_buf&0xFF);enc_buf>>=8;enc_bc-=8;}}
             if(enc_bc>0)*out++=(uint8_t)(enc_buf&0xFF);
         }else if(tag==2){
-            uint8_t lens[256];uint16_t code[256];uint8_t bits[256];
-            hlens(fq,lens);hcodes(lens,code,bits);
-            uint32_t used=h_enc(gp,gs,lens,code,bits,out,(size_t)(edd-out));
+            uint32_t used;
+            if(gs >= (1u<<20))
+                used = h_enc_seg(gp, gs, out, (size_t)(edd-out));
+            else {
+                uint8_t lens[256];uint16_t code[256];uint8_t bits[256];
+                hlens(fq,lens);hcodes(lens,code,bits);
+                used = h_enc(gp,gs,lens,code,bits,out,(size_t)(edd-out));
+            }
             if(used==0||(size_t)(edd-out)<used){free(trial);free(trans);free(lagbuf);return-1;}
             out+=used;
         }else{
@@ -484,7 +581,10 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 }
             }
         }else{
-            if(h_dec(&p,edd,gp,gs)<0){if(stride>1)free(trans);return-1;}
+            int hrc;
+            if(gs >= (1u<<20)) hrc = h_dec_seg(&p,edd,gp,gs);
+            else               hrc = h_dec(&p,edd,gp,gs);
+            if(hrc<0){if(stride>1)free(trans);return-1;}
         }
     }
     /* v2: read the stride remainder tail bytes (never delta-coded) */

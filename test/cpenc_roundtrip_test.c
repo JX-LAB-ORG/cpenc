@@ -48,6 +48,22 @@ int main(void) {
     }
     CHK(ok, "30 boundary sizes (1B..16MB)");
 
+    printf("[c5] large low-entropy blocks (segmented Huffman path)\n");
+    /* 0-heavy multi-symbol data: forces tag=2 Huffman on >=1MB groups,
+     * exercising the segmented (parallel-decodable) codec path */
+    ok = 1;
+    for (int trial = 0; trial < 3; trial++) {
+        size_t n = (size_t)(2 + trial) * 1024 * 1024;   /* 2MB, 3MB, 4MB */
+        uint8_t *in = malloc(n);
+        for (size_t i = 0; i < n; i++) {
+            uint32_t r = rnd();
+            in[i] = ((r & 0xFF) < 200) ? (uint8_t)((r >> 8) & 0x3F) : 0;
+        }
+        if (!rt(in, n)) { ok = 0; printf("  FAIL size %zu\n", n); }
+        free(in);
+    }
+    CHK(ok, "large low-entropy blocks (seg path)");
+
     printf("[c2] special patterns roundtrip\n");
     {
         uint8_t *in = malloc(65536);
