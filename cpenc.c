@@ -498,26 +498,219 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
 
         size_t sz_raw=4+gs; uint8_t tag;
         double gp_ent=fq_ent(fq,gs);
-        size_t h_p=(size_t)(gs*gp_ent/8.0);if(h_p<gs/32)h_p=gs/32;
+        /* huffman min length is 1 bit/symbol for the dominant symbol:
+         * the bitstream floor is gs/8 bytes, not gs/32 (was badly
+         * underestimating skewed groups, steering them to Huffman) */
+        size_t h_p=(size_t)(gs*gp_ent/8.0);if(h_p<gs/8)h_p=gs/8;
         size_t sz_h=264+h_p*103/100+16;
 
         if(nz<=1){tag=0;}
-        else if(nz<=32){
+        else{
             int bits=1;while((1<<bits)<nz&&bits<HUFF_MAX)bits++;
             size_t sz_l=6+(size_t)nz+gs*(size_t)bits/8+5;
-            /* nz<=32 with skewed frequencies (text: nz~30, ent~3.9) loses
-             * 0.5-1 bit/symbol to fixed-width LUT — always compare Huffman */
-            tag = sz_l<sz_raw ? 1 : 3;
-            if(sz_h<sz_l && sz_h<sz_raw) tag=2;
+            size_t sz_best=sz_raw; tag=3;
+            if(sz_l<sz_best){tag=1;sz_best=sz_l;}
+            if(sz_h<sz_best){tag=2;sz_best=sz_h;}
+            /* tag 5: single-value dominance — one symbol covers >99% of the
+             * group.  Encode the constant plus a short exception list
+             * (positions LEB128 + values), vs Huffman's wasteful 1-bit-per-
+             * symbol all-zero bitstream.  Complements RLE (zeros) with
+             * non-zero constants (e.g. transposed struct groups). */
+            {
+                uint32_t dom = 0;
+                for (int i2 = 0; i2 < 256; i2++) if (fq[i2] > dom) { dom = fq[i2]; }
+                if (dom > (uint32_t)gs - gs/100 && dom < (uint32_t)gs && gs >= 1024) {
+                    /* estimate: const byte + count(4) + LEB128 pos (avg 4B) + value */
+                    uint32_t nex = (uint32_t)gs - dom;
+                    size_t sz_c = 5 + (size_t)nex*5;
+                    if (sz_c < sz_best) { tag = 5; }
+                }
+            }
+            /* RLE candidate (tag 4): zero-heavy groups get run-length coded.
+             * Strict alternation: zero-run then value; consecutive nonzeros
+             * are separated by run=0.  Runs are 8-bit with 255 = continuation. */
+            if(fq[0] > (uint32_t)gs*3/4 && gs >= 64){
+                /* build run/value streams */
+                uint32_t *runs = malloc((gs/2+2)*sizeof(uint32_t));
+                uint8_t *vls = malloc(gs);
+                if(runs && vls){
+                    size_t nr=0,nv=0,i;
+                    if(gp[0]!=0) runs[nr++]=0;
+                    for(i=0;i<gs;){
+                        if(gp[i]==0){size_t j=i;while(j<gs&&gp[j]==0)j++;
+                            runs[nr++]=(uint32_t)(j-i);i=j;}
+                        else{if(i>0&&gp[i-1]!=0)runs[nr++]=0;
+                            vls[nv++]=gp[i];i++;}
+                    }
+
+                    /* runs as LEB128 stream (1M run -> 4 bytes) */
+                    uint8_t *r8=malloc(nr*5+2);
+                    size_t nr8=0;
+                    for(size_t k=0;k<nr;k++){uint32_t r=runs[k];
+                        do{uint8_t b=(uint8_t)(r&0x7F);r>>=7;
+                            if(r)b|=0x80;
+                            r8[nr8++]=b;}while(r);}
+
+                    /* estimate sub-block sizes (reuse LUT/Huffman formulas) */
+                    uint32_t rq[256]={0};for(size_t k=0;k<nr8;k++)rq[r8[k]]++;
+                    uint32_t vq[256]={0};for(size_t k=0;k<nv;k++)vq[vls[k]]++;
+                    int rnz=0,vnz=0;
+                    for(int i2=0;i2<256;i2++){if(rq[i2])rnz++;if(vq[i2])vnz++;}
+                    size_t sr=sz_raw,vr=sz_raw;
+                    if(rnz<=1)sr=6;
+                    else{int rb=1;while((1<<rb)<rnz&&rb<HUFF_MAX)rb++;
+                        size_t sl=6+rnz+nr8*(size_t)rb/8+5;
+                        double re=fq_ent(rq,nr8);size_t hp=(size_t)(nr8*re/8.0);if(hp<nr8/8)hp=nr8/8;
+                        size_t sh=264+hp*103/100+16;
+                        sr=sl<sh?sl:sh; if(sr>sz_raw)sr=sz_raw;}
+                    if(vnz<=1)vr=6;
+                    else{int vb=1;while((1<<vb)<vnz&&vb<HUFF_MAX)vb++;
+                        size_t sl=6+vnz+nv*(size_t)vb/8+5;
+                        double ve=fq_ent(vq,nv);size_t hp=(size_t)(nv*ve/8.0);if(hp<nv/8)hp=nv/8;
+                        size_t sh=264+hp*103/100+16;
+                        vr=sl<sh?sl:sh; if(vr>sz_raw)vr=sz_raw;}
+                    size_t sz_rle=2+sr+vr;
+                    if(sz_rle<sz_best){tag=4;}
+                    free(r8);free(vls);free(runs);
+                }else{free(runs);free(vls);}
+            }
         }
-        else{tag=sz_h<sz_raw?2:3;}
 
         if(out>=edd){free(trial);free(trans);free(lagbuf);return-1;} *out++=tag;
-        if(tag==0){
+        if(tag==4){
+            /* RLE: rebuild streams and encode both sub-blocks with the
+             * standard per-subtag machinery (constants/LUT/Huffman/RAW) */
+            uint32_t *runs = malloc((gs/2+2)*sizeof(uint32_t));
+            uint8_t *vls = malloc(gs);
+            if(!runs||!vls){free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+            size_t nr=0,nv=0,i;
+            if(gp[0]!=0) runs[nr++]=0;
+            for(i=0;i<gs;){
+                if(gp[i]==0){size_t j=i;while(j<gs&&gp[j]==0)j++;
+                    runs[nr++]=(uint32_t)(j-i);i=j;}
+                else{if(i>0&&gp[i-1]!=0)runs[nr++]=0;
+                    vls[nv++]=gp[i];i++;}
+            }
+            uint8_t *r8=malloc(nr*5+2);
+            if(!r8){free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+            size_t nr8=0;
+            for(size_t k=0;k<nr;k++){uint32_t r=runs[k];
+                do{uint8_t b=(uint8_t)(r&0x7F);r>>=7;
+                    if(r)b|=0x80;
+                    r8[nr8++]=b;}while(r);}
+            /* encode runs sub-block (subtag) */
+            uint32_t rq[256]={0};for(size_t k=0;k<nr8;k++)rq[r8[k]]++;
+            int rnz=0;for(int i2=0;i2<256;i2++)if(rq[i2])rnz++;
+            uint8_t st;
+            if(rnz<=1)st=0;
+            else{
+                int rb=1;while((1<<rb)<rnz&&rb<HUFF_MAX)rb++;
+                size_t sl=6+rnz+nr8*(size_t)rb/8+5;
+                double re=fq_ent(rq,nr8);size_t hp=(size_t)(nr8*re/8.0);if(hp<nr8/8)hp=nr8/8;
+                size_t sh=264+hp*103/100+16;
+                size_t raw=4+nr8;
+                st = sl<sh ? (sl<raw?1:3) : (sh<raw?2:3);
+            }
+            if(out>=edd){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+            *out++=st;
+            if(st==0){
+                uint8_t val=0;for(int i2=0;i2<256;i2++)if(rq[i2]){val=(uint8_t)i2;break;}
+                if(out+6>edd){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+                *out++=nr8&0xFF;*out++=(nr8>>8)&0xFF;*out++=(nr8>>16)&0xFF;*out++=nr8>>24;
+                *out++=val;*out++=(uint8_t)(rnz-1);
+            }else if(st==1){
+                int rb=1;while((1<<rb)<rnz&&rb<HUFF_MAX)rb++;
+                uint8_t lut[32],rev[256]={0};int li=0;
+                for(int i2=0;i2<256&&li<rnz;i2++)if(rq[i2]){lut[li]=(uint8_t)i2;rev[i2]=(uint8_t)li;li++;}
+                size_t need=6+(size_t)rnz+nr8*(size_t)rb/8+1;
+                if((size_t)(edd-out)<need){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+                *out++=nr8&0xFF;*out++=(nr8>>8)&0xFF;*out++=(nr8>>16)&0xFF;*out++=nr8>>24;
+                *out++=(uint8_t)(rnz-1);
+                for(int i2=0;i2<rnz;i2++)*out++=lut[i2];
+                uint64_t enc_buf=0;int enc_bc=0;
+                for(size_t k=0;k<nr8;k++){enc_buf|=(uint64_t)rev[r8[k]]<<enc_bc;enc_bc+=rb;
+                    while(enc_bc>=8){*out++=(uint8_t)(enc_buf&0xFF);enc_buf>>=8;enc_bc-=8;}}
+                if(enc_bc>0)*out++=(uint8_t)(enc_buf&0xFF);
+            }else if(st==2){
+                uint8_t lens[256];uint16_t code[256];uint8_t bits[256];
+                hlens(rq,lens);hcodes(lens,code,bits);
+                uint32_t used=h_enc(r8,nr8,lens,code,bits,out,(size_t)(edd-out));
+                if(used==0||(size_t)(edd-out)<used){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+                out+=used;
+            }else{
+                if((size_t)(edd-out)<4+nr8){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+                *out++=nr8&0xFF;*out++=(nr8>>8)&0xFF;*out++=(nr8>>16)&0xFF;*out++=nr8>>24;
+                memcpy(out,r8,nr8);out+=nr8;
+            }
+            /* encode vals sub-block */
+            uint32_t vq[256]={0};for(size_t k=0;k<nv;k++)vq[vls[k]]++;
+            int vnz=0;for(int i2=0;i2<256;i2++)if(vq[i2])vnz++;
+            if(vnz<=1)st=0;
+            else{
+                int vb=1;while((1<<vb)<vnz&&vb<HUFF_MAX)vb++;
+                size_t sl=6+vnz+nv*(size_t)vb/8+5;
+                double ve=fq_ent(vq,nv);size_t hp=(size_t)(nv*ve/8.0);if(hp<nv/8)hp=nv/8;
+                size_t sh=264+hp*103/100+16;
+                size_t raw=4+nv;
+                st = sl<sh ? (sl<raw?1:3) : (sh<raw?2:3);
+            }
+            if(out>=edd){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+            *out++=st;
+            if(st==0){
+                uint8_t val=0;for(int i2=0;i2<256;i2++)if(vq[i2]){val=(uint8_t)i2;break;}
+                if(out+6>edd){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+                *out++=nv&0xFF;*out++=(nv>>8)&0xFF;*out++=(nv>>16)&0xFF;*out++=nv>>24;
+                *out++=val;*out++=(uint8_t)(vnz-1);
+            }else if(st==1){
+                int vb=1;while((1<<vb)<vnz&&vb<HUFF_MAX)vb++;
+                uint8_t lut[32],rev[256]={0};int li=0;
+                for(int i2=0;i2<256&&li<vnz;i2++)if(vq[i2]){lut[li]=(uint8_t)i2;rev[i2]=(uint8_t)li;li++;}
+                size_t need=6+(size_t)vnz+nv*(size_t)vb/8+1;
+                if((size_t)(edd-out)<need){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+                *out++=nv&0xFF;*out++=(nv>>8)&0xFF;*out++=(nv>>16)&0xFF;*out++=nv>>24;
+                *out++=(uint8_t)(vnz-1);
+                for(int i2=0;i2<vnz;i2++)*out++=lut[i2];
+                uint64_t enc_buf=0;int enc_bc=0;
+                for(size_t k=0;k<nv;k++){enc_buf|=(uint64_t)rev[vls[k]]<<enc_bc;enc_bc+=vb;
+                    while(enc_bc>=8){*out++=(uint8_t)(enc_buf&0xFF);enc_buf>>=8;enc_bc-=8;}}
+                if(enc_bc>0)*out++=(uint8_t)(enc_buf&0xFF);
+            }else if(st==2){
+                uint8_t lens[256];uint16_t code[256];uint8_t bits[256];
+                hlens(vq,lens);hcodes(lens,code,bits);
+                uint32_t used=h_enc(vls,nv,lens,code,bits,out,(size_t)(edd-out));
+                if(used==0||(size_t)(edd-out)<used){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+                out+=used;
+            }else{
+                if((size_t)(edd-out)<4+nv){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
+                *out++=nv&0xFF;*out++=(nv>>8)&0xFF;*out++=(nv>>16)&0xFF;*out++=nv>>24;
+                memcpy(out,vls,nv);out+=nv;
+            }
+            free(r8);free(runs);free(vls);
+        }else if(tag==0){
             uint8_t val=0;for(int i=0;i<256;i++)if(fq[i]){val=(uint8_t)i;break;}
             if(out+6>edd){free(trial);free(trans);free(lagbuf);return-1;}
             *out++=gs&0xFF;*out++=(gs>>8)&0xFF;*out++=(gs>>16)&0xFF;*out++=gs>>24;
             *out++=val;*out++=(uint8_t)(nz-1);
+        }else if(tag==5){
+            /* const + exceptions: [val][nex 4B][pos LEB128 stream][val stream] */
+            uint32_t domv2 = 0, dom2 = 0;
+            for (int i2 = 0; i2 < 256; i2++) if (fq[i2] > dom2) { dom2 = fq[i2]; domv2 = (uint32_t)i2; }
+            uint32_t nex = (uint32_t)gs - dom2;
+            if (out+5 > edd){free(trial);free(trans);free(lagbuf);return-1;}
+            *out++=(uint8_t)domv2;
+            *out++=nex&0xFF;*out++=(nex>>8)&0xFF;*out++=(nex>>16)&0xFF;*out++=nex>>24;
+            /* exception positions (absolute) LEB128 + values */
+            for (size_t i2 = 0; i2 < gs; i2++) {
+                if (gp[i2] != (uint8_t)domv2) {
+                    uint32_t pos = (uint32_t)i2;
+                    uint8_t lb[4]; int ln = 0;
+                    do { lb[ln++] = (uint8_t)(pos & 0x7F); pos >>= 7;
+                         if (pos) lb[ln-1] |= 0x80; } while (pos);
+                    for (int b2 = 0; b2 < ln; b2++) { if (out >= edd){free(trial);free(trans);free(lagbuf);return-1;} *out++ = lb[b2]; }
+                    if (out >= edd){free(trial);free(trans);free(lagbuf);return-1;}
+                    *out++ = gp[i2];
+                }
+            }
         }else if(tag==1){
             int bits=1;while((1<<bits)<nz&&bits<HUFF_MAX)bits++;
             uint8_t lut[32],rev[256]={0};int li=0;
@@ -673,6 +866,121 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     gp[i]=idx<nz?lut[idx]:lut[0];
                 }
             }
+        }else if(tag==5){
+            /* const + exceptions: [val][nex][pos LEB128][values] */
+            if((size_t)(edd-p)<5){if(stride>1)free(trans);return-1;}
+            uint8_t cval=*p++;
+            uint32_t nex=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
+            if(nex>gs){if(stride>1)free(trans);return-1;}
+            memset(gp,cval,gs);
+            for(uint32_t k=0;k<nex;k++){
+                uint32_t pos=0,shift=0;
+                for(;;){
+                    if(p>=edd){if(stride>1)free(trans);return-1;}
+                    uint8_t b=*p++;
+                    pos|=(uint32_t)(b&0x7F)<<shift;
+                    if(!(b&0x80))break;
+                    shift+=7;
+                }
+                if(p>=edd||pos>=gs){if(stride>1)free(trans);return-1;}
+                gp[pos]=*p++;
+            }
+        }else if(tag==4){
+            /* RLE: decode runs and vals sub-blocks, alternate fill */
+            if(p>=edd){if(stride>1)free(trans);return-1;}
+            uint8_t st=*p++;
+            uint32_t *runs_buf = malloc((gs/2+2)*sizeof(uint32_t));
+            uint8_t *vals_buf = malloc(gs);
+            uint8_t *scratch = malloc(gs);
+            if(!runs_buf||!vals_buf||!scratch){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+            size_t nr=0,nv=0;
+            if(st==0){
+                if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
+                uint8_t val=*p++;p++;
+                if(tgs>gs/2+1){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                for(size_t k=0;k<tgs;k++)runs_buf[nr++]=(uint32_t)val;
+            }else if(st==1){
+                if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
+                uint8_t nz1=*p++;int nz=nz1+1;
+                uint8_t lut[256];for(int i=0;i<nz;i++){if(p>=edd){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}lut[i]=*p++;}
+                if(tgs>gs/2+1){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                int nbits=1;while((1<<nbits)<nz&&nbits<12)nbits++;
+                uint64_t rbuf=0;int rbc=0;
+                for(size_t i=0;i<tgs;i++){
+                    while(rbc<nbits&&p<edd){rbuf|=(uint64_t)(*p++)<<rbc;rbc+=8;}
+                    uint8_t idx=rbuf&((1<<nbits)-1);rbuf>>=nbits;rbc-=nbits;
+                    runs_buf[nr++]=(uint32_t)(idx<nz?lut[idx]:lut[0]);
+                }
+            }else if(st==2){
+                /* huffman sub-block: symbol count lives in the stream header */
+                if((size_t)(edd-p)<264){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                uint32_t rn=(uint32_t)p[256]|((uint32_t)p[257]<<8)|((uint32_t)p[258]<<16)|((uint32_t)p[259]<<24);
+                if(rn>gs/2+2){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(h_dec(&p,edd,scratch,rn)<0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                for(size_t k=0;k<rn;k++)runs_buf[nr++]=(uint32_t)scratch[k];
+            }else if(st==3){
+                if((size_t)(edd-p)<4){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                uint32_t rl=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
+                if(rl>gs/2+1||(size_t)(edd-p)<rl){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                for(size_t k=0;k<rl;k++)runs_buf[nr++]=(uint32_t)p[k];
+                p+=rl;
+            }
+            /* vals sub-block */
+            if(p>=edd){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+            st=*p++;
+            if(st==0){
+                if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
+                uint8_t val=*p++;p++;
+                if(tgs>gs){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                for(size_t k=0;k<tgs;k++)vals_buf[nv++]=(uint8_t)val;
+            }else if(st==1){
+                if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
+                uint8_t nz1=*p++;int nz=nz1+1;
+                uint8_t lut[256];for(int i=0;i<nz;i++){if(p>=edd){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}lut[i]=*p++;}
+                if(tgs>gs){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                int nbits=1;while((1<<nbits)<nz&&nbits<12)nbits++;
+                uint64_t rbuf=0;int rbc=0;
+                for(size_t i=0;i<tgs;i++){
+                    while(rbc<nbits&&p<edd){rbuf|=(uint64_t)(*p++)<<rbc;rbc+=8;}
+                    uint8_t idx=rbuf&((1<<nbits)-1);rbuf>>=nbits;rbc-=nbits;
+                    vals_buf[nv++]=(uint8_t)(idx<nz?lut[idx]:lut[0]);
+                }
+            }else if(st==2){
+                if((size_t)(edd-p)<264){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                uint32_t rn=(uint32_t)p[256]|((uint32_t)p[257]<<8)|((uint32_t)p[258]<<16)|((uint32_t)p[259]<<24);
+                if(rn>gs){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(h_dec(&p,edd,vals_buf,rn)<0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                nv=rn;
+            }else if(st==3){
+                if((size_t)(edd-p)<4){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                uint32_t rl=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
+                if(rl>gs||(size_t)(edd-p)<rl){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                memcpy(vals_buf,p,rl);nv=rl;p+=rl;
+            }
+            /* alternate fill: run zeros, then value */
+            size_t di=0,ri=0,vi=0;
+            while(di<gs){
+                /* decode one LEB128 run length */
+                uint32_t r=0,shift=0;
+                for(;;){
+                    if(ri>=nr){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                    uint8_t b=(uint8_t)runs_buf[ri++];
+                    r|=(uint32_t)(b&0x7F)<<shift;
+                    if(!(b&0x80))break;
+                    shift+=7;
+                }
+                if(r>gs-di)r=(uint32_t)(gs-di);
+                memset(gp+di,0,r);di+=r;
+                if(di<gs){
+                    if(vi>=nv){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                    gp[di++]=vals_buf[vi++];
+                }
+            }
+            free(runs_buf);free(vals_buf);free(scratch);
         }else{
             int hrc;
             if(stride==1 && orders[g]==1 && lag_idx==0)
