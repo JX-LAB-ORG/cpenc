@@ -9,11 +9,29 @@
 #define HUFF_WSZ (1<<HUFF_MAX)
 #define HUFF_TABSZ (HUFF_WSZ * 2)
 
-/* ── entropy from freq table ───────────────────────────────── */
+/* ── entropy from freq table ─────────────────────────────────
+ * fq_ent is called per group (tens of thousands per block); 256 libm
+ * log2 calls each would dominate — precompute log2 for the integer
+ * count range (segmented groups are <= 64KB so the table covers the
+ * hot path; larger counts fall back to log2). */
+static double lg2t[65537];
+static int lg2_init_done = 0;
+static void lg2_init(void) {
+    if (lg2_init_done) return;
+    for (int i = 0; i <= 65536; i++) lg2t[i] = log2((double)i);
+    lg2_init_done = 1;
+}
 static double fq_ent(const uint32_t fq[256], size_t tot) {
     if(!tot) return 0;
-    double h=0, iv=1.0/(double)tot;
-    for(int i=0;i<256;i++) if(fq[i]){double pr=(double)fq[i]*iv; h-=pr*log2(pr);}
+    double h=0;
+    double lgt = tot <= 65536 ? lg2t[tot] : log2((double)tot);
+    for(int i=0;i<256;i++){
+        uint32_t c = fq[i];
+        if(c){
+            double lc = c <= 65536 ? lg2t[c] : log2((double)c);
+            h -= (double)c * (lc - lgt) / (double)tot;
+        }
+    }
     return h;
 }
 
@@ -151,7 +169,17 @@ static uint32_t h_enc(const uint8_t *d,size_t n,const uint8_t lens[256],const ui
     for(int i=0;i<256;i++)ob[i]=lens[i];
     ob[256]=n&0xFF;ob[257]=(n>>8)&0xFF;ob[258]=(n>>16)&0xFF;ob[259]=n>>24;
     uint8_t *bst=ob+264,*op=bst;uint64_t buf=0;int cnt=0;
-    for(size_t i=0;i<n;i++){int s=d[i];buf=(buf<<bits[s])|code[s];cnt+=bits[s];
+    /* 3-symbol unroll: max 3*15+7 = 52 bits, fits the 64-bit buffer */
+    size_t i=0;
+    for(;i+3<=n;i+=3){
+        int s0=d[i],s1=d[i+1],s2=d[i+2];
+        buf=(buf<<bits[s0])|code[s0];
+        buf=(buf<<bits[s1])|code[s1];
+        buf=(buf<<bits[s2])|code[s2];
+        cnt+=bits[s0]+bits[s1]+bits[s2];
+        while(cnt>=8){cnt-=8;*op++=(uint8_t)(buf>>cnt);buf&=((1ULL<<cnt)-1);}
+    }
+    for(;i<n;i++){int s=d[i];buf=(buf<<bits[s])|code[s];cnt+=bits[s];
         while(cnt>=8){cnt-=8;*op++=(uint8_t)(buf>>cnt);buf&=((1ULL<<cnt)-1);}}
     if(cnt>0)*op++=(uint8_t)(buf<<(8-cnt));
     uint32_t bsl=(uint32_t)(op-bst);ob[260]=bsl&0xFF;ob[261]=(bsl>>8)&0xFF;ob[262]=(bsl>>16)&0xFF;ob[263]=bsl>>24;
@@ -435,6 +463,7 @@ size_t cpenc_max_compressed_size(size_t sl) {
 }
 
 int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
+    lg2_init();
     const uint8_t *s=(const uint8_t*)sv; uint8_t *d=(uint8_t*)dv;
     CPEncHeader *h=(CPEncHeader*)d;
     if(*dl<CPENC_HEADER_SIZE) return -1;
@@ -572,32 +601,77 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
     }
 
     /* v3: lag-delta preprocessing — catches fixed-frame periodicity
-     * (log rows, protocol frames, config tables).  Pure O(1) arithmetic,
-     * no search.  Dense lag scan 16..255 with sampling entropy picks any
-     * real frame length; ~240 x 4KB sampling ≈ a few ms per 64MB block. */
+     * (log rows, protocol frames, config tables).  Coarse scan (every 16)
+     * then fine scan around the best; high-entropy segments skip entirely
+     * (no frame periodicity to find).  Diff + entropy merged into one pass. */
     int lag_idx = CPENC_LAG_NONE;
     uint8_t *lagbuf = NULL;
     if (sl >= 4096) {
         size_t k = sl < 8192 ? sl : 8192;
         double best_e = ent(s, k);
-        uint8_t *t = malloc(k);
-        if (t) {
-            for (int p = CPENC_LAG_MIN; p <= CPENC_LAG_MAX; p++) {
-                if (p >= (int)k) break;
-                for (size_t i = 0; i < k; i++)
-                    t[i] = (uint8_t)(s[i] - (i >= (size_t)p ? s[i - (size_t)p] : 0));
-                double e = ent(t, k);
-                if (e < best_e - 0.05) { best_e = e; lag_idx = p; }
+        int best_p = 0;
+        if (getenv("CPENC_DBG")) fprintf(stderr, "[lag] pre ent=%f\n", best_e);
+        /* near-uniform (>6.0) or near-constant (<1.0) segments have no
+         * frame periodicity worth scanning for */
+        if (best_e > 1.0 && best_e < 6.0) {
+            /* coarse: 16 candidates instead of 240, small sample (frame
+             * periods 16..255 are visible in 2048 bytes) */
+            size_t kc = k < 2048 ? k : 2048;
+            for (int p = CPENC_LAG_MIN; p <= CPENC_LAG_MAX && p < (int)kc; p += 16) {
+                uint32_t c[256] = {0};
+                for (size_t i = 0; i < kc; i++) {
+                    uint8_t v = (uint8_t)(s[i] - (i >= (size_t)p ? s[i - (size_t)p] : 0));
+                    c[v]++;
+                }
+                double h = fq_ent(c, kc);
+                if (getenv("CPENC_DBG")) fprintf(stderr, "[lag coarse] p=%d h=%f\n", p, h);
+                if (h < best_e - 0.05) { best_e = h; best_p = p; }
             }
-            free(t);
+            if (best_p) {
+                lag_idx = best_p;               /* coarse candidate as floor:
+                                                 * fine scan re-tests it at the
+                                                 * same entropy, which can't
+                                                 * beat the -0.05 margin */
+                size_t kf = k < 4096 ? k : 4096;
+                int lo = best_p - 8; if (lo < CPENC_LAG_MIN) lo = CPENC_LAG_MIN;
+                int hi = best_p + 8; if (hi > CPENC_LAG_MAX) hi = CPENC_LAG_MAX;
+                for (int p = lo; p <= hi && p < (int)kf; p++) {
+                    uint32_t c[256] = {0};
+                    for (size_t i = 0; i < kf; i++) {
+                        uint8_t v = (uint8_t)(s[i] - (i >= (size_t)p ? s[i - (size_t)p] : 0));
+                        c[v]++;
+                    }
+                    double h = fq_ent(c, kf);
+                    if (h < best_e - 0.05) { best_e = h; lag_idx = p; }
+                }
+            }
         }
     }
+    if (getenv("CPENC_DBG")) fprintf(stderr, "[lag] sl=%zu lag_idx=%d\n", sl, lag_idx);
     if (lag_idx) {
         lagbuf = malloc(sl);
         if (!lagbuf) return -2;
         for (size_t i = 0; i < sl; i++)
             lagbuf[i] = (uint8_t)(s[i] - (i >= (size_t)lag_idx ? s[i - (size_t)lag_idx] : 0));
         s = lagbuf;
+    }
+
+    /* near-random segments: entropy > 7.5 means no delta/transform can
+     * help — store raw.  lag_idx is 0 here (pre-filter skips the scan),
+     * so the RAW decode path's lag restore is a no-op. */
+    if (sl >= 1024) {
+        double seg_e = ent(s, sl);
+        if (seg_e > 7.5) {
+            size_t ext = hex_mode ? 2 : 1;
+            if (*dl < CPENC_HEADER_SIZE + ext + sl) { free(lagbuf); free(hexbuf); return -1; }
+            h->magic=CPENC_MAGIC;h->version=CPENC_VERSION;
+            h->stride= hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_RAW;
+            h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(ext+sl);
+            if(hex_mode) d[CPENC_HEADER_SIZE]=CPENC_STRIDE_RAW;
+            d[CPENC_HEADER_SIZE+ext-1]=(uint8_t)lag_idx;
+            memcpy(d+CPENC_HEADER_SIZE+ext,s,sl);*dl=CPENC_HEADER_SIZE+ext+sl;
+            free(lagbuf);free(hexbuf);return 0;
+        }
     }
 
     int stride=ds(s,sl);
@@ -612,18 +686,21 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
     }
 
     if(stride>1&&sl>=256){
-        size_t gs_test=sl/(size_t)stride;
-        uint8_t *tt=malloc(sl),*tb=malloc(gs_test);
-        int nraw=0;
-        if(tt&&tb){
-            tr(s,tt,sl,stride);
-            for(int g=0;g<stride;g++){uint8_t *gp=tt+(size_t)g*gs_test;
-                memcpy(tb,gp,gs_test);double e0=ent(tb,gs_test);
-                de(tb,gs_test,1);double e1=ent(tb,gs_test);
-                if(e0>6.5&&e1>6.5)nraw++;}
-            if(nraw==stride)stride=1;
+        size_t k2 = sl < 1024 ? sl : 1024;
+        size_t gs_test = k2/(size_t)stride;
+        if(gs_test >= 64){
+            uint8_t *tt=malloc(k2),*tb=malloc(gs_test);
+            int nraw=0;
+            if(tt&&tb){
+                tr(s,tt,k2,stride);
+                for(int g=0;g<stride;g++){uint8_t *gp=tt+(size_t)g*gs_test;
+                    memcpy(tb,gp,gs_test);double e0=ent(tb,gs_test);
+                    de(tb,gs_test,1);double e1=ent(tb,gs_test);
+                    if(e0>6.5&&e1>6.5)nraw++;}
+                if(nraw==stride)stride=1;
+            }
+            free(tt);free(tb);
         }
-        free(tt);free(tb);
     }
 
     size_t gs=sl/(size_t)stride;
@@ -712,57 +789,15 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
             }
             /* RLE candidate (tag 4): zero-heavy groups get run-length coded.
              * Strict alternation: zero-run then value; consecutive nonzeros
-             * are separated by run=0.  Runs are 8-bit with 255 = continuation. */
-            if(fq[0] > (uint32_t)gs*3/4 && gs >= 64){
-                /* build run/value streams */
-                uint32_t *runs = malloc((gs/2+2)*sizeof(uint32_t));
-                uint8_t *vls = malloc(gs);
-                if(runs && vls){
-                    size_t nr=0,nv=0,i;
-                    if(gp[0]!=0) runs[nr++]=0;
-                    for(i=0;i<gs;){
-                        if(gp[i]==0){size_t j=i;while(j<gs&&gp[j]==0)j++;
-                            runs[nr++]=(uint32_t)(j-i);i=j;}
-                        else{if(i>0&&gp[i-1]!=0)runs[nr++]=0;
-                            vls[nv++]=gp[i];i++;}
-                    }
-
-                    /* runs as direct lengths, 255 = escape+LEB128 remainder */
-                    uint8_t *r8=malloc(nr*5+2);
-                    size_t nr8=0;
-                    for(size_t k=0;k<nr;k++){
-                        if(runs[k]<255){r8[nr8++]=(uint8_t)runs[k];}
-                        else{r8[nr8++]=255;   /* 255 itself must escape: decoder treats 255 as marker */
-                            uint32_t r=runs[k]-255;
-                            do{uint8_t b=(uint8_t)(r&0x7F);r>>=7;
-                                if(r)b|=0x80;
-                                r8[nr8++]=b;}while(r);}
-                    }
-
-                    /* estimate sub-block sizes (reuse LUT/Huffman formulas) */
-                    uint32_t rq[256]={0};for(size_t k=0;k<nr8;k++)rq[r8[k]]++;
-                    uint32_t vq[256]={0};for(size_t k=0;k<nv;k++)vq[vls[k]]++;
-                    int rnz=0,vnz=0;
-                    for(int i2=0;i2<256;i2++){if(rq[i2])rnz++;if(vq[i2])vnz++;}
-                    size_t sr=sz_raw,vr=sz_raw;
-                    if(rnz<=1)sr=6;
-                    else{int rb=1;while((1<<rb)<rnz&&rb<HUFF_MAX)rb++;
-                        size_t sl=6+rnz+nr8*(size_t)rb/8+5;
-                        double re=fq_ent(rq,nr8);size_t hp=(size_t)(nr8*re/8.0);if(hp<nr8/8)hp=nr8/8;
-                        size_t sh=264+hp*103/100+16;
-                        sr=sl<sh?sl:sh; if(sr>sz_raw)sr=sz_raw;
-                        size_t s5=sub5_estimate(rq,nr8); if(s5<sr)sr=s5;}
-                    if(vnz<=1)vr=6;
-                    else{int vb=1;while((1<<vb)<vnz&&vb<HUFF_MAX)vb++;
-                        size_t sl=6+vnz+nv*(size_t)vb/8+5;
-                        double ve=fq_ent(vq,nv);size_t hp=(size_t)(nv*ve/8.0);if(hp<nv/8)hp=nv/8;
-                        size_t sh=264+hp*103/100+16;
-                        vr=sl<sh?sl:sh; if(vr>sz_raw)vr=sz_raw;
-                        size_t s5=sub5_estimate(vq,nv); if(s5<vr)vr=s5;}
-                    size_t sz_rle=2+sr+vr;
+             * are separated by run=0.  Runs are 8-bit with 255 = continuation.
+             * Estimate cheaply from the histogram (no stream build): non-zero
+             * bytes nv produce at most ~2nv+1 runs; sub-blocks RAW-sized. */
+            if(fq[0] > (uint32_t)gs*9/10 && gs >= 64){
+                size_t nv = (size_t)gs - fq[0];
+                size_t nr_est = 2*nv + 1;
+                size_t sz_rle = 2 + (4 + nr_est + nr_est/5) + (4 + nv);
                     if(sz_rle<sz_best){tag=4;}
-                    free(r8);free(vls);free(runs);
-                }else{free(runs);free(vls);}
+                if(sz_rle<sz_best){tag=4;}
             }
         }
 
@@ -1021,7 +1056,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         size_t blk = h->original_size;
         if(sl < CPENC_HEADER_SIZE + 1){ if(getenv("CPENC_DBG"))fprintf(stderr,"[hex dec] fail: too short\n"); return -1; }
         int rs = s[CPENC_HEADER_SIZE];      /* real stride of the inner block */
-        if(!((rs >= 1 && rs <= 8) || rs == CPENC_STRIDE_SEG)) return -1;
+        if(!((rs >= 1 && rs <= 8) || rs == CPENC_STRIDE_SEG || rs == CPENC_STRIDE_RAW)) return -1;
         uint8_t *ns = malloc(sl);
         if(!ns) return -1;
         memcpy(ns, s, sl);
