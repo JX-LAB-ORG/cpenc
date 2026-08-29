@@ -9,9 +9,11 @@ extern "C" {
 
 /* ─── CPEnc block header (12 + stride bytes) ─────────────────── */
 #define CPENC_MAGIC   0x4350   /* 'CP' */
-#define CPENC_VERSION 3        /* v2: stride remainder bytes in stream;
-                                * v3: 1 lag byte before orders (lag delta) */
+#define CPENC_VERSION 4        /* v2: stride remainder bytes in stream;
+                                * v3: 1 lag byte before orders (lag delta);
+                                * v4: stride 0xFE = hex-ascii to binary layer */
 #define CPENC_STRIDE_RAW 0xFF  /* RAW passthrough stride */
+#define CPENC_STRIDE_HEX 0xFE  /* hex-ascii text: 2:1 to binary + sep table */
 #define CPENC_LAG_NONE 0
 #define CPENC_LAG_MIN  16
 #define CPENC_LAG_MAX  255      /* lag byte stores the lag itself */
