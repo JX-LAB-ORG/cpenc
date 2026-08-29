@@ -9,12 +9,16 @@ extern "C" {
 
 /* ─── CPEnc block header (12 + stride bytes) ─────────────────── */
 #define CPENC_MAGIC   0x4350   /* 'CP' */
-#define CPENC_VERSION 4        /* v2: stride remainder bytes in stream;
+#define CPENC_VERSION 5        /* v2: stride remainder bytes in stream;
                                 * v3: 1 lag byte before orders (lag delta);
-                                * v4: stride 0xFE = hex-ascii to binary layer */
+                                * v4: stride 0xFE = hex-ascii to binary layer;
+                                * v5: stride 0xFD = internal segmentation */
 #define CPENC_STRIDE_RAW 0xFF  /* RAW passthrough stride */
 #define CPENC_STRIDE_HEX 0xFE  /* hex-ascii text: 2:1 to binary + sep table */
+#define CPENC_STRIDE_SEG 0xFD  /* segmented: per-segment lag+stride */
 #define CPENC_LAG_NONE 0
+#define CPENC_SEG_SIZE  (64u << 10)   /* segment granularity */
+#define CPENC_SEG_MIN   (1u << 20)    /* block must be >= 1MB to segment */
 #define CPENC_LAG_MIN  16
 #define CPENC_LAG_MAX  255      /* lag byte stores the lag itself */
 

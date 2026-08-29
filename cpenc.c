@@ -531,6 +531,46 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
         }
     }
 
+    /* v5: internal segmentation — mixed blocks (struct tables + text +
+     * random...) can't share one lag/stride; a single global pick helps
+     * the sampled region and hurts the rest.  Split into 64KB segments,
+     * each compressed independently as a sub-block (own lag/stride/tags);
+     * segment lengths make the stream self-delimiting.  Segments smaller
+     * than the threshold recurse as plain single-block calls. */
+    if (sl >= CPENC_SEG_MIN) {
+        size_t n_seg = (sl + CPENC_SEG_SIZE - 1) / CPENC_SEG_SIZE;
+        size_t ext = hex_mode ? 1 : 0;      /* real-stride byte for hex wrapper */
+        size_t need = CPENC_HEADER_SIZE + ext + 4 + n_seg * 4;
+        if (*dl < need) { free(hexbuf); return -1; }
+        h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
+        h->stride = hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_SEG;
+        h->original_size = (uint32_t)sl;
+        uint8_t *op = d + CPENC_HEADER_SIZE;
+        if (hex_mode) *op++ = CPENC_STRIDE_SEG;
+        *op++ = (uint8_t)(n_seg & 0xFF); *op++ = (uint8_t)((n_seg >> 8) & 0xFF);
+        *op++ = (uint8_t)((n_seg >> 16) & 0xFF); *op++ = (uint8_t)((n_seg >> 24) & 0xFF);
+        uint8_t *lenp = op;
+        op += n_seg * 4;
+        for (size_t k = 0; k < n_seg; k++) {
+            size_t seg_off = k * CPENC_SEG_SIZE;
+            size_t seg_len = sl - seg_off;
+            if (seg_len > CPENC_SEG_SIZE) seg_len = CPENC_SEG_SIZE;
+            size_t clen = (size_t)(*dl - (op - d));
+            if (cpenc_compress(s + seg_off, seg_len, op, &clen, mo) != 0) {
+                free(hexbuf); return -1;
+            }
+            lenp[k * 4 + 0] = (uint8_t)(clen & 0xFF);
+            lenp[k * 4 + 1] = (uint8_t)((clen >> 8) & 0xFF);
+            lenp[k * 4 + 2] = (uint8_t)((clen >> 16) & 0xFF);
+            lenp[k * 4 + 3] = (uint8_t)((clen >> 24) & 0xFF);
+            op += clen;
+        }
+        h->compressed_size = (uint32_t)(op - d - CPENC_HEADER_SIZE);
+        *dl = (size_t)(op - d);
+        free(hexbuf);
+        return 0;
+    }
+
     /* v3: lag-delta preprocessing — catches fixed-frame periodicity
      * (log rows, protocol frames, config tables).  Pure O(1) arithmetic,
      * no search.  Dense lag scan 16..255 with sampling entropy picks any
@@ -946,6 +986,33 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
     /* v1 blocks (no stride remainder) remain decodable; reject only
      * unknown versions and garbage magic */
     if(h->magic!=CPENC_MAGIC||h->version<1||h->version>CPENC_VERSION) return -1;
+    if(h->stride==CPENC_STRIDE_SEG){
+        /* v5: independent sub-blocks, lengths in a u32 array */
+        const uint8_t *p = s + CPENC_HEADER_SIZE;
+        if(sl < CPENC_HEADER_SIZE + 4) return -1;
+        uint32_t n_seg = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+        p += 4;
+        uint32_t max_seg = (h->original_size + CPENC_SEG_SIZE - 1) / CPENC_SEG_SIZE;
+        if(n_seg < 1 || n_seg > max_seg) return -1;
+        if(sl < CPENC_HEADER_SIZE + 4 + (size_t)n_seg * 4) return -1;
+        const uint8_t *sp = p + (size_t)n_seg * 4;
+        size_t o = 0;
+        for(uint32_t k = 0; k < n_seg; k++) {
+            uint32_t clen = (uint32_t)p[k*4] | ((uint32_t)p[k*4+1]<<8) | ((uint32_t)p[k*4+2]<<16) | ((uint32_t)p[k*4+3]<<24);
+            if((size_t)(sp + clen) > (size_t)s + sl) return -1;
+            size_t dl_k = h->original_size - o;
+            if(dl_k > CPENC_SEG_SIZE) dl_k = CPENC_SEG_SIZE;
+            if((size_t)*dl < o + dl_k) return -1;
+            if(cpenc_decompress(sp, clen, d + o, &dl_k) != 0) return -1;
+            size_t want = h->original_size - o;
+            if(want > CPENC_SEG_SIZE) want = CPENC_SEG_SIZE;
+            if(dl_k != want) return -1;
+            o += dl_k;
+            sp += clen;
+        }
+        *dl = o;
+        return 0;
+    }
     if(h->stride==CPENC_STRIDE_HEX){
         /* v4 hex layer: the payload is a standard block compressing
          * [bin_len u32][n_sep u32][(idx LEB128)(char)]*n_sep [bin bytes].
@@ -954,7 +1021,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         size_t blk = h->original_size;
         if(sl < CPENC_HEADER_SIZE + 1){ if(getenv("CPENC_DBG"))fprintf(stderr,"[hex dec] fail: too short\n"); return -1; }
         int rs = s[CPENC_HEADER_SIZE];      /* real stride of the inner block */
-        if(rs < 1 || rs > 8){ if(getenv("CPENC_DBG"))fprintf(stderr,"[hex dec] fail: rs=%d\n",rs); return -1; }
+        if(!((rs >= 1 && rs <= 8) || rs == CPENC_STRIDE_SEG)) return -1;
         uint8_t *ns = malloc(sl);
         if(!ns) return -1;
         memcpy(ns, s, sl);
