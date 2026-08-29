@@ -159,6 +159,67 @@ static uint32_t h_enc(const uint8_t *d,size_t n,const uint8_t lens[256],const ui
 }
 
 static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n);
+/* ── const+exceptions sub-block (subtag 4): [len u32][cval u8][nex u32]
+ *    [pos LEB128][val u8] each — for streams dominated by one symbol ── */
+static size_t sub5_estimate(const uint32_t cnt[256], size_t n) {
+    uint32_t dom = 0;
+    for (int i = 0; i < 256; i++) if (cnt[i] > dom) dom = cnt[i];
+    return 9 + (size_t)(n - dom) * 5;
+}
+static int sub5_encode(uint8_t **po, const uint8_t *edd, const uint8_t *sym,
+                       size_t n, const uint32_t cnt[256]) {
+    uint8_t *out = *po;
+    uint32_t dom = 0, domv = 0;
+    for (int i = 0; i < 256; i++) if (cnt[i] > dom) { dom = cnt[i]; domv = (uint32_t)i; }
+    if (out + 9 > edd) return -1;
+    *out++ = (uint8_t)(n & 0xFF); *out++ = (uint8_t)((n >> 8) & 0xFF);
+    *out++ = (uint8_t)((n >> 16) & 0xFF); *out++ = (uint8_t)((n >> 24) & 0xFF);
+    *out++ = (uint8_t)domv;
+    uint32_t nex = (uint32_t)n - dom;
+    *out++ = (uint8_t)(nex & 0xFF); *out++ = (uint8_t)((nex >> 8) & 0xFF);
+    *out++ = (uint8_t)((nex >> 16) & 0xFF); *out++ = (uint8_t)((nex >> 24) & 0xFF);
+    for (size_t k = 0; k < n; k++) {
+        if (sym[k] != (uint8_t)domv) {
+            uint32_t pos = (uint32_t)k;
+            uint8_t lb[4]; int ln = 0;
+            do { lb[ln++] = (uint8_t)(pos & 0x7F); pos >>= 7;
+                 if (pos) lb[ln-1] |= 0x80; } while (pos);
+            for (int b2 = 0; b2 < ln; b2++) { if (out >= edd) return -1; *out++ = lb[b2]; }
+            if (out >= edd) return -1;
+            *out++ = sym[k];
+        }
+    }
+    *po = out;
+    return 0;
+}
+static int sub5_decode(const uint8_t **pp, const uint8_t *edd, uint8_t *out,
+                       size_t outcap, uint32_t *plen) {
+    const uint8_t *p = *pp;
+    if ((size_t)(edd - p) < 9) return -1;
+    uint32_t len = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); p += 4;
+    if (len > outcap) return -1;
+    uint8_t cval = *p++;
+    uint32_t nex = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); p += 4;
+    if (nex > len) return -1;
+    memset(out, cval, len);
+    for (uint32_t i = 0; i < nex; i++) {
+        uint32_t pos = 0; int sh2 = 0;
+        for (;;) {
+            if (p >= edd) return -1;
+            uint8_t b = *p++;
+            pos |= (uint32_t)(b & 0x7F) << sh2;
+            if (!(b & 0x80)) break;
+            sh2 += 7;
+            if (sh2 >= 28) return -1;
+        }
+        if (pos >= len) return -1;
+        if (p >= edd) return -1;
+        out[pos] = *p++;
+    }
+    *pp = p;
+    *plen = len;
+    return 0;
+}
 /* Segmented Huffman: split the symbol stream into SEGS independent
  * Huffman blocks (own table each).  Header: [SEGS][SEGS x u32 len].  Lets
  * the decoder run segments in parallel; table overhead ~SEGS*264B. */
@@ -566,13 +627,15 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                         size_t sl=6+rnz+nr8*(size_t)rb/8+5;
                         double re=fq_ent(rq,nr8);size_t hp=(size_t)(nr8*re/8.0);if(hp<nr8/8)hp=nr8/8;
                         size_t sh=264+hp*103/100+16;
-                        sr=sl<sh?sl:sh; if(sr>sz_raw)sr=sz_raw;}
+                        sr=sl<sh?sl:sh; if(sr>sz_raw)sr=sz_raw;
+                        size_t s5=sub5_estimate(rq,nr8); if(s5<sr)sr=s5;}
                     if(vnz<=1)vr=6;
                     else{int vb=1;while((1<<vb)<vnz&&vb<HUFF_MAX)vb++;
                         size_t sl=6+vnz+nv*(size_t)vb/8+5;
                         double ve=fq_ent(vq,nv);size_t hp=(size_t)(nv*ve/8.0);if(hp<nv/8)hp=nv/8;
                         size_t sh=264+hp*103/100+16;
-                        vr=sl<sh?sl:sh; if(vr>sz_raw)vr=sz_raw;}
+                        vr=sl<sh?sl:sh; if(vr>sz_raw)vr=sz_raw;
+                        size_t s5=sub5_estimate(vq,nv); if(s5<vr)vr=s5;}
                     size_t sz_rle=2+sr+vr;
                     if(sz_rle<sz_best){tag=4;}
                     free(r8);free(vls);free(runs);
@@ -618,7 +681,11 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                 double re=fq_ent(rq,nr8);size_t hp=(size_t)(nr8*re/8.0);if(hp<nr8/8)hp=nr8/8;
                 size_t sh=264+hp*103/100+16;
                 size_t raw=4+nr8;
-                st = sl<sh ? (sl<raw?1:3) : (sh<raw?2:3);
+                size_t s5=sub5_estimate(rq,nr8);
+                size_t best=sl; st=1;
+                if(sh<best){best=sh;st=2;}
+                if(raw<best){best=raw;st=3;}
+                if(s5<best){best=s5;st=4;}
             }
             if(out>=edd){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
             *out++=st;
@@ -627,6 +694,8 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                 if(out+6>edd){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
                 *out++=nr8&0xFF;*out++=(nr8>>8)&0xFF;*out++=(nr8>>16)&0xFF;*out++=nr8>>24;
                 *out++=val;*out++=(uint8_t)(rnz-1);
+            }else if(st==4){
+                if(sub5_encode(&out,edd,r8,nr8,rq)!=0){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
             }else if(st==1){
                 int rb=1;while((1<<rb)<rnz&&rb<HUFF_MAX)rb++;
                 uint8_t lut[32],rev[256]={0};int li=0;
@@ -661,7 +730,11 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                 double ve=fq_ent(vq,nv);size_t hp=(size_t)(nv*ve/8.0);if(hp<nv/8)hp=nv/8;
                 size_t sh=264+hp*103/100+16;
                 size_t raw=4+nv;
-                st = sl<sh ? (sl<raw?1:3) : (sh<raw?2:3);
+                size_t s5=sub5_estimate(vq,nv);
+                size_t best=sl; st=1;
+                if(sh<best){best=sh;st=2;}
+                if(raw<best){best=raw;st=3;}
+                if(s5<best){best=s5;st=4;}
             }
             if(out>=edd){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
             *out++=st;
@@ -670,6 +743,8 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                 if(out+6>edd){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
                 *out++=nv&0xFF;*out++=(nv>>8)&0xFF;*out++=(nv>>16)&0xFF;*out++=nv>>24;
                 *out++=val;*out++=(uint8_t)(vnz-1);
+            }else if(st==4){
+                if(sub5_encode(&out,edd,vls,nv,vq)!=0){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
             }else if(st==1){
                 int vb=1;while((1<<vb)<vnz&&vb<HUFF_MAX)vb++;
                 uint8_t lut[32],rev[256]={0};int li=0;
@@ -935,6 +1010,10 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 if(rl>gs/2+1||(size_t)(edd-p)<rl){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<rl;k++)runs_buf[nr++]=(uint32_t)p[k];
                 p+=rl;
+            }else if(st==4){
+                uint32_t tlen=0;
+                if(sub5_decode(&p,edd,scratch,gs/2+2,&tlen)!=0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                for(size_t k=0;k<tlen;k++)runs_buf[nr++]=(uint32_t)scratch[k];
             }
             /* vals sub-block */
 
@@ -971,6 +1050,10 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 uint32_t rl=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
                 if(rl>gs||(size_t)(edd-p)<rl){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 memcpy(vals_buf,p,rl);nv=rl;p+=rl;
+            }else if(st==4){
+                uint32_t tlen=0;
+                if(sub5_decode(&p,edd,vals_buf,gs,&tlen)!=0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                nv=tlen;
             }
             /* alternate fill: run zeros, then value */
             size_t di=0,ri=0,vi=0;
