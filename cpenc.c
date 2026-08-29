@@ -383,13 +383,14 @@ static int h_dec_p(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n,i
         uint16_t v=(uint16_t)(((uint32_t)b<<8)|s);
         for(int x=0;x<xm;x++){uint32_t fi=((uint32_t)c<<(HUFF_MAX-b))|(uint32_t)x;if(fi<HUFF_TABSZ)fast[fi]=v;}}}
     size_t tgt=ul<n?ul:n;uint64_t buf=0;int cnt=0;
+    int norefill = getenv("CPENC_NOREFILL") ? 1 : 0;
     for(size_t dc=0;dc<tgt;){
         /* batch refill: one 4-byte load covers ~3-4 symbols instead of
          * per-symbol byte reads.  The bitstream is MSB-first, so each
          * loaded byte must be bit-reversed before shifting into the
          * window (a plain LE load would feed LSB-first bits to the
          * consumer).  cnt stays <= 64 (refill gated at 32). */
-        if(!getenv("CPENC_NOREFILL")&&cnt<=32&&src+4<=bse){
+        if(!norefill&&cnt<=32&&src+4<=bse){
             uint32_t w;memcpy(&w,src,4);src+=4;
             /* old bits move up (like the per-byte buf<<8), new bytes land
              * in the low end — MSB-first consumer reads the old bits first */
@@ -446,13 +447,14 @@ static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n){
         uint16_t v=(uint16_t)(((uint32_t)b<<8)|s);
         for(int x=0;x<xm;x++){uint32_t fi=((uint32_t)c<<(HUFF_MAX-b))|(uint32_t)x;if(fi<HUFF_TABSZ)fast[fi]=v;}}}
     size_t tgt=ul<n?ul:n;uint64_t buf=0;int cnt=0;
+    int norefill = getenv("CPENC_NOREFILL") ? 1 : 0;
     for(size_t dc=0;dc<tgt;){
         /* batch refill: one 4-byte load covers ~3-4 symbols instead of
          * per-symbol byte reads.  The bitstream is MSB-first, so each
          * loaded byte must be bit-reversed before shifting into the
          * window (a plain LE load would feed LSB-first bits to the
          * consumer).  cnt stays <= 64 (refill gated at 32). */
-        if(!getenv("CPENC_NOREFILL")&&cnt<=32&&src+4<=bse){
+        if(!norefill&&cnt<=32&&src+4<=bse){
             uint32_t w;memcpy(&w,src,4);src+=4;
             /* old bits move up (like the per-byte buf<<8), new bytes land
              * in the low end — MSB-first consumer reads the old bits first */
@@ -651,7 +653,6 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
         size_t k = sl < 8192 ? sl : 8192;
         double best_e = ent(s, k);
         int best_p = 0;
-        if (getenv("CPENC_DBG")) fprintf(stderr, "[lag] pre ent=%f\n", best_e);
         /* near-uniform (>6.0) or near-constant (<1.0) segments have no
          * frame periodicity worth scanning for */
         if (best_e > 1.0 && best_e < 6.0) {
@@ -665,7 +666,6 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                     c[v]++;
                 }
                 double h = fq_ent(c, kc);
-                if (getenv("CPENC_DBG")) fprintf(stderr, "[lag coarse] p=%d h=%f\n", p, h);
                 if (h < best_e - 0.05) { best_e = h; best_p = p; }
             }
             if (best_p) {
@@ -688,7 +688,6 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
             }
         }
     }
-    if (getenv("CPENC_DBG")) fprintf(stderr, "[lag] sl=%zu lag_idx=%d\n", sl, lag_idx);
     if (lag_idx) {
         lagbuf = malloc(sl);
         if (!lagbuf) return -2;
@@ -1095,7 +1094,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
          * Decompress it as an ordinary block (stride forced to 1 so this
          * branch isn't re-entered), then restore the hex-ascii layout. */
         size_t blk = h->original_size;
-        if(sl < CPENC_HEADER_SIZE + 1){ if(getenv("CPENC_DBG"))fprintf(stderr,"[hex dec] fail: too short\n"); return -1; }
+        if(sl < CPENC_HEADER_SIZE + 1) return -1;
         int rs = s[CPENC_HEADER_SIZE];      /* real stride of the inner block */
         if(!((rs >= 1 && rs <= 8) || rs == CPENC_STRIDE_SEG || rs == CPENC_STRIDE_RAW)) return -1;
         uint8_t *ns = malloc(sl);
@@ -1106,16 +1105,16 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         uint8_t *tmp = malloc(blk ? blk : 1);
         if(!tmp){ free(ns); return -1; }
         size_t tdl = blk;
-        if(cpenc_decompress(ns, sl, tmp, &tdl) != 0){ if(getenv("CPENC_DBG"))fprintf(stderr,"[hex dec] fail: inner rc\n"); free(ns); free(tmp); return -1; }
+        if(cpenc_decompress(ns, sl, tmp, &tdl) != 0){ free(ns); free(tmp); return -1; }
         free(ns);
-        if(tdl < 13){ if(getenv("CPENC_DBG"))fprintf(stderr,"[hex dec] fail: tdl=%zu\n",tdl); free(tmp); return -1; }
+        if(tdl < 13){ free(tmp); return -1; }
         uint32_t orig_len = (uint32_t)tmp[0] | ((uint32_t)tmp[1]<<8) | ((uint32_t)tmp[2]<<16) | ((uint32_t)tmp[3]<<24);
         int hex_case = tmp[4] ? 1 : 0;
         uint32_t bin_len = (uint32_t)tmp[5] | ((uint32_t)tmp[6]<<8) | ((uint32_t)tmp[7]<<16) | ((uint32_t)tmp[8]<<24);
         uint32_t n_sep = (uint32_t)tmp[9] | ((uint32_t)tmp[10]<<8) | ((uint32_t)tmp[11]<<16) | ((uint32_t)tmp[12]<<24);
-        if((size_t)13 + n_sep + bin_len > tdl){ if(getenv("CPENC_DBG"))fprintf(stderr,"[hex dec] fail: sizes bl=%u ns=%u tdl=%zu\n",bin_len,n_sep,tdl); free(tmp); return -1; }
+        if((size_t)13 + n_sep + bin_len > tdl){ free(tmp); return -1; }
         size_t restore = (size_t)orig_len;
-        if(*dl < restore){ if(getenv("CPENC_DBG"))fprintf(stderr,"[hex dec] fail: dl=%zu restore=%zu\n",*dl,restore); free(tmp); return -1; }
+        if(*dl < restore){ free(tmp); return -1; }
         const uint8_t *bin = tmp + 13;
         const uint8_t *tab = bin + bin_len;
         static const char *hexd_lc = "0123456789abcdef";
@@ -1131,7 +1130,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 for(;;){ uint8_t b = tab[oi++]; idx |= (uint32_t)(b & 0x7F) << sh;
                          if(!(b & 0x80)) break; sh += 7;
                          if(oi >= n_sep && (b & 0x80)){ free(tmp); return -1; } }
-                if(idx == vi) { d[o++] = tab[oi++]; if(getenv("CPENC_DBG") && o < 400) fprintf(stderr,"[ins] vi=%zu idx=%u\n",vi,idx); }
+                if(idx == vi) { d[o++] = tab[oi++];  }
                 else { oi = save; break; }
             }
             d[o++] = (uint8_t)hexd[bin[i] >> 4];
@@ -1145,7 +1144,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             if(idx != vi){ free(tmp); return -1; }
             d[o++] = tab[oi++];
         }
-        if(o != restore){ if(getenv("CPENC_DBG"))fprintf(stderr,"[hex dec] fail: restore o=%zu expect=%zu\n",o,restore); free(tmp); return -1; }
+        if(o != restore){ free(tmp); return -1; }
         *dl = o;
         free(tmp);
         return 0;
