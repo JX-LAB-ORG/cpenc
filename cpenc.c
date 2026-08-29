@@ -522,7 +522,7 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                 if (dom > (uint32_t)gs - gs/100 && dom < (uint32_t)gs && gs >= 1024) {
                     /* estimate: const byte + count(4) + LEB128 pos (avg 4B) + value */
                     uint32_t nex = (uint32_t)gs - dom;
-                    size_t sz_c = 5 + (size_t)nex*5;
+                    size_t sz_c = 6 + (size_t)nex*5;
                     if (sz_c < sz_best) { tag = 5; }
                 }
             }
@@ -543,13 +543,17 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                             vls[nv++]=gp[i];i++;}
                     }
 
-                    /* runs as LEB128 stream (1M run -> 4 bytes) */
+                    /* runs as direct lengths, 255 = escape+LEB128 remainder */
                     uint8_t *r8=malloc(nr*5+2);
                     size_t nr8=0;
-                    for(size_t k=0;k<nr;k++){uint32_t r=runs[k];
-                        do{uint8_t b=(uint8_t)(r&0x7F);r>>=7;
-                            if(r)b|=0x80;
-                            r8[nr8++]=b;}while(r);}
+                    for(size_t k=0;k<nr;k++){
+                        if(runs[k]<255){r8[nr8++]=(uint8_t)runs[k];}
+                        else{r8[nr8++]=255;   /* 255 itself must escape: decoder treats 255 as marker */
+                            uint32_t r=runs[k]-255;
+                            do{uint8_t b=(uint8_t)(r&0x7F);r>>=7;
+                                if(r)b|=0x80;
+                                r8[nr8++]=b;}while(r);}
+                    }
 
                     /* estimate sub-block sizes (reuse LUT/Huffman formulas) */
                     uint32_t rq[256]={0};for(size_t k=0;k<nr8;k++)rq[r8[k]]++;
@@ -594,10 +598,15 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
             uint8_t *r8=malloc(nr*5+2);
             if(!r8){free(runs);free(vls);free(trial);free(trans);free(lagbuf);return-1;}
             size_t nr8=0;
-            for(size_t k=0;k<nr;k++){uint32_t r=runs[k];
-                do{uint8_t b=(uint8_t)(r&0x7F);r>>=7;
-                    if(r)b|=0x80;
-                    r8[nr8++]=b;}while(r);}
+            for(size_t k=0;k<nr;k++){
+                if(runs[k]<255){r8[nr8++]=(uint8_t)runs[k];}
+                else{r8[nr8++]=255;   /* escape: length-255 remainder in LEB128 */
+                    uint32_t r=runs[k]-255;
+                    do{uint8_t b=(uint8_t)(r&0x7F);r>>=7;
+                        if(r)b|=0x80;
+                        r8[nr8++]=b;}while(r);}
+            }
+
             /* encode runs sub-block (subtag) */
             uint32_t rq[256]={0};for(size_t k=0;k<nr8;k++)rq[r8[k]]++;
             int rnz=0;for(int i2=0;i2<256;i2++)if(rq[i2])rnz++;
@@ -696,8 +705,8 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
             uint32_t domv2 = 0, dom2 = 0;
             for (int i2 = 0; i2 < 256; i2++) if (fq[i2] > dom2) { dom2 = fq[i2]; domv2 = (uint32_t)i2; }
             uint32_t nex = (uint32_t)gs - dom2;
-            if (out+5 > edd){free(trial);free(trans);free(lagbuf);return-1;}
-            *out++=(uint8_t)domv2;
+            if (out+6 > edd){free(trial);free(trans);free(lagbuf);return-1;}
+            *out++=(uint8_t)(domv2&0xFF);*out++=(uint8_t)(domv2>>8);
             *out++=nex&0xFF;*out++=(nex>>8)&0xFF;*out++=(nex>>16)&0xFF;*out++=nex>>24;
             /* exception positions (absolute) LEB128 + values */
             for (size_t i2 = 0; i2 < gs; i2++) {
@@ -868,8 +877,8 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             }
         }else if(tag==5){
             /* const + exceptions: [val][nex][pos LEB128][values] */
-            if((size_t)(edd-p)<5){if(stride>1)free(trans);return-1;}
-            uint8_t cval=*p++;
+            if((size_t)(edd-p)<6){if(stride>1)free(trans);return-1;}
+            uint16_t cval=(uint16_t)(p[0]|(p[1]<<8));p+=2;
             uint32_t nex=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
             if(nex>gs){if(stride>1)free(trans);return-1;}
             memset(gp,cval,gs);
@@ -928,8 +937,10 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 p+=rl;
             }
             /* vals sub-block */
+
             if(p>=edd){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
             st=*p++;
+
             if(st==0){
                 if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
@@ -966,12 +977,22 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             while(di<gs){
                 /* decode one LEB128 run length */
                 uint32_t r=0,shift=0;
+
                 for(;;){
                     if(ri>=nr){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                     uint8_t b=(uint8_t)runs_buf[ri++];
-                    r|=(uint32_t)(b&0x7F)<<shift;
-                    if(!(b&0x80))break;
-                    shift+=7;
+                    if(b<255){r=(uint32_t)b;break;}
+                    r=255;
+                    /* escape: remainder in LEB128 — accumulate with + (r is
+                     * preset 255 whose bits are all set; |= would no-op) */
+                    for(;;){
+                        if(ri>=nr){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                        uint8_t c2=(uint8_t)runs_buf[ri++];
+                        r+=(uint32_t)(c2&0x7F)<<shift;
+                        if(!(c2&0x80))break;
+                        shift+=7;
+                    }
+                    break;
                 }
                 if(r>gs-di)r=(uint32_t)(gs-di);
                 memset(gp+di,0,r);di+=r;
