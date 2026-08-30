@@ -8,13 +8,14 @@ typedef struct { uint32_t idx, r1, r2; } Sfx;
  * (high-first would be MSD, which needs bucket recursion — wrong here). */
 static void radix_pass(Sfx *a, Sfx *tmp, size_t n, int hi16) {
     /* LSD order: low 16 bits first (stable), then high 16 bits. */
-    size_t cnt[65536] = {0};
+    uint32_t cnt[65536];
+    memset(cnt, 0, sizeof(cnt));
     for (size_t i = 0; i < n; i++) {
         uint32_t v = hi16 ? (a[i].r1 & 0xFFFF) : (a[i].r2 & 0xFFFF);
         cnt[v]++;
     }
-    size_t sum = 0;
-    for (int i = 0; i < 65536; i++) { size_t c = cnt[i]; cnt[i] = sum; sum += c; }
+    uint32_t sum = 0;
+    for (int i = 0; i < 65536; i++) { uint32_t c = cnt[i]; cnt[i] = sum; sum += c; }
     for (size_t i = 0; i < n; i++) {
         uint32_t v = hi16 ? (a[i].r1 & 0xFFFF) : (a[i].r2 & 0xFFFF);
         tmp[cnt[v]++] = a[i];
@@ -25,7 +26,7 @@ static void radix_pass(Sfx *a, Sfx *tmp, size_t n, int hi16) {
         cnt[v]++;
     }
     sum = 0;
-    for (int i = 0; i < 65536; i++) { size_t c = cnt[i]; cnt[i] = sum; sum += c; }
+    for (int i = 0; i < 65536; i++) { uint32_t c = cnt[i]; cnt[i] = sum; sum += c; }
     for (size_t i = 0; i < n; i++) {
         uint32_t v = hi16 ? (tmp[i].r1 >> 16) : (tmp[i].r2 >> 16);
         a[cnt[v]++] = tmp[i];
