@@ -204,6 +204,40 @@ static uint32_t h_enc(const uint8_t *d,size_t n,const uint8_t lens[256],const ui
 }
 
 static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n);
+/* ── segment-level parallelism ─────────────────────────────────
+ * v5 segments are independent: compress/decompress them across
+ * threads.  Opt-in: default auto (only for enough segments),
+ * CPENC_THREADS=N forces N, CPENC_NO_THREADS=1 forces 1 (PRoot's
+ * scheduler can wedge under load — the env fallback stays). */
+static int seg_threads(size_t n_seg) {
+    /* default single-threaded: PRoot's scheduler penalizes threads,
+     * and small blocks lose to thread setup.  CPENC_THREADS=N opts in
+     * (real hardware / servers); CPENC_NO_THREADS=1 forces off. */
+    const char *ts = getenv("CPENC_THREADS");
+    if (getenv("CPENC_NO_THREADS")) return 1;
+    if (!ts) return 1;
+    int n = atoi(ts);
+    if (n < 1) return 1;
+    if (n > 16) n = 16;
+    if ((size_t)n > n_seg) n = (int)n_seg;
+    return n;
+}
+typedef struct { const uint8_t *src; size_t len; uint8_t *out; size_t cap; size_t outlen; int rc; int mo; } SegEncJob;
+static void *seg_enc_worker(void *arg) {
+    SegEncJob *j = arg;
+    size_t dl = j->cap;
+    j->rc = cpenc_compress(j->src, j->len, j->out, &dl, j->mo);
+    j->outlen = dl;
+    return NULL;
+}
+typedef struct { const uint8_t *src; size_t clen; uint8_t *out; size_t cap; size_t outlen; int rc; } SegDecJob;
+static void *seg_dec_worker(void *arg) {
+    SegDecJob *j = arg;
+    size_t dl = j->cap;
+    j->rc = cpenc_decompress(j->src, j->clen, j->out, &dl);
+    j->outlen = dl;
+    return NULL;
+}
 /* ── const+exceptions sub-block (subtag 4): [len u32][cval u8][nex u32]
  *    [pos LEB128][val u8] each — for streams dominated by one symbol ── */
 static size_t sub5_estimate(const uint32_t cnt[256], size_t n) {
@@ -623,19 +657,58 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
         *op++ = (uint8_t)((n_seg >> 16) & 0xFF); *op++ = (uint8_t)((n_seg >> 24) & 0xFF);
         uint8_t *lenp = op;
         op += n_seg * 4;
-        for (size_t k = 0; k < n_seg; k++) {
-            size_t seg_off = k * CPENC_SEG_SIZE;
-            size_t seg_len = sl - seg_off;
-            if (seg_len > CPENC_SEG_SIZE) seg_len = CPENC_SEG_SIZE;
-            size_t clen = (size_t)(*dl - (op - d));
-            if (cpenc_compress(s + seg_off, seg_len, op, &clen, mo) != 0) {
-                free(hexbuf); return -1;
+        int nthr = seg_threads(n_seg);
+        if (nthr > 1) {
+            /* parallel: each segment compresses into its own buffer,
+             * then a sequential pass assembles the stream */
+            uint8_t **bufs = malloc(n_seg * sizeof(uint8_t*));
+            SegEncJob *jobs = calloc(n_seg, sizeof(SegEncJob));
+            if (!bufs || !jobs) { free(bufs); free(jobs); free(hexbuf); return -1; }
+            for (size_t k = 0; k < n_seg; k++) {
+                bufs[k] = malloc(cpenc_max_compressed_size(CPENC_SEG_SIZE) + 64);
+                if (!bufs[k]) { for (size_t j = 0; j < k; j++) free(bufs[j]); free(bufs); free(jobs); free(hexbuf); return -1; }
+                jobs[k].src = s + k * CPENC_SEG_SIZE;
+                jobs[k].len = sl - k * CPENC_SEG_SIZE;
+                if (jobs[k].len > CPENC_SEG_SIZE) jobs[k].len = CPENC_SEG_SIZE;
+                jobs[k].out = bufs[k];
+                jobs[k].cap = cpenc_max_compressed_size(CPENC_SEG_SIZE) + 64;
+                jobs[k].mo = mo;
             }
-            lenp[k * 4 + 0] = (uint8_t)(clen & 0xFF);
-            lenp[k * 4 + 1] = (uint8_t)((clen >> 8) & 0xFF);
-            lenp[k * 4 + 2] = (uint8_t)((clen >> 16) & 0xFF);
-            lenp[k * 4 + 3] = (uint8_t)((clen >> 24) & 0xFF);
-            op += clen;
+            pthread_t th[16];
+            for (size_t base = 0; base < n_seg; base += (size_t)nthr) {
+                int nb = (int)(n_seg - base < (size_t)nthr ? n_seg - base : (size_t)nthr);
+                for (int i = 0; i < nb; i++) pthread_create(&th[i], NULL, seg_enc_worker, &jobs[base + i]);
+                for (int i = 0; i < nb; i++) pthread_join(th[i], NULL);
+            }
+            for (size_t k = 0; k < n_seg; k++) {
+                if (jobs[k].rc != 0 || jobs[k].outlen > (size_t)(*dl - (op - d))) {
+                    for (size_t j = 0; j < n_seg; j++) free(bufs[j]);
+                    free(bufs); free(jobs); free(hexbuf); return -1;
+                }
+                lenp[k * 4 + 0] = (uint8_t)(jobs[k].outlen & 0xFF);
+                lenp[k * 4 + 1] = (uint8_t)((jobs[k].outlen >> 8) & 0xFF);
+                lenp[k * 4 + 2] = (uint8_t)((jobs[k].outlen >> 16) & 0xFF);
+                lenp[k * 4 + 3] = (uint8_t)((jobs[k].outlen >> 24) & 0xFF);
+                memcpy(op, bufs[k], jobs[k].outlen);
+                op += jobs[k].outlen;
+            }
+            for (size_t j = 0; j < n_seg; j++) free(bufs[j]);
+            free(bufs); free(jobs);
+        } else {
+            for (size_t k = 0; k < n_seg; k++) {
+                size_t seg_off = k * CPENC_SEG_SIZE;
+                size_t seg_len = sl - seg_off;
+                if (seg_len > CPENC_SEG_SIZE) seg_len = CPENC_SEG_SIZE;
+                size_t clen = (size_t)(*dl - (op - d));
+                if (cpenc_compress(s + seg_off, seg_len, op, &clen, mo) != 0) {
+                    free(hexbuf); return -1;
+                }
+                lenp[k * 4 + 0] = (uint8_t)(clen & 0xFF);
+                lenp[k * 4 + 1] = (uint8_t)((clen >> 8) & 0xFF);
+                lenp[k * 4 + 2] = (uint8_t)((clen >> 16) & 0xFF);
+                lenp[k * 4 + 3] = (uint8_t)((clen >> 24) & 0xFF);
+                op += clen;
+            }
         }
         h->compressed_size = (uint32_t)(op - d - CPENC_HEADER_SIZE);
         *dl = (size_t)(op - d);
@@ -1071,10 +1144,56 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         if(n_seg < 1 || n_seg > max_seg) return -1;
         if(sl < CPENC_HEADER_SIZE + 4 + (size_t)n_seg * 4) return -1;
         const uint8_t *sp = p + (size_t)n_seg * 4;
-        size_t o = 0;
+        /* validate all lengths up front */
         for(uint32_t k = 0; k < n_seg; k++) {
             uint32_t clen = (uint32_t)p[k*4] | ((uint32_t)p[k*4+1]<<8) | ((uint32_t)p[k*4+2]<<16) | ((uint32_t)p[k*4+3]<<24);
             if((size_t)(sp + clen) > (size_t)s + sl) return -1;
+            sp += clen;
+        }
+        sp = p + (size_t)n_seg * 4;
+        int nthr = seg_threads(n_seg);
+        if (nthr > 1) {
+            /* parallel decode into per-segment buffers, then assemble */
+            uint8_t **bufs = malloc(n_seg * sizeof(uint8_t*));
+            SegDecJob *jobs = calloc(n_seg, sizeof(SegDecJob));
+            if (!bufs || !jobs) { free(bufs); free(jobs); return -1; }
+            for (uint32_t k = 0; k < n_seg; k++) {
+                uint32_t clen = (uint32_t)p[k*4] | ((uint32_t)p[k*4+1]<<8) | ((uint32_t)p[k*4+2]<<16) | ((uint32_t)p[k*4+3]<<24);
+                size_t dl_k = h->original_size - (size_t)k * CPENC_SEG_SIZE;
+                if (dl_k > CPENC_SEG_SIZE) dl_k = CPENC_SEG_SIZE;
+                bufs[k] = malloc(dl_k ? dl_k : 1);
+                if (!bufs[k]) { for (uint32_t j = 0; j < k; j++) free(bufs[j]); free(bufs); free(jobs); return -1; }
+                jobs[k].src = sp; jobs[k].clen = clen;
+                jobs[k].out = bufs[k]; jobs[k].cap = dl_k;
+                sp += clen;
+            }
+            pthread_t th[16];
+            for (uint32_t base = 0; base < n_seg; base += (uint32_t)nthr) {
+                int nb = (int)(n_seg - base < (uint32_t)nthr ? n_seg - base : (uint32_t)nthr);
+                for (int i = 0; i < nb; i++) pthread_create(&th[i], NULL, seg_dec_worker, &jobs[base + i]);
+                for (int i = 0; i < nb; i++) pthread_join(th[i], NULL);
+            }
+            size_t o = 0;
+            for (uint32_t k = 0; k < n_seg; k++) {
+                if (jobs[k].rc != 0 || jobs[k].outlen != jobs[k].cap) {
+                    for (uint32_t j = 0; j < n_seg; j++) free(bufs[j]);
+                    free(bufs); free(jobs); return -1;
+                }
+                if ((size_t)*dl < o + jobs[k].outlen) {
+                    for (uint32_t j = 0; j < n_seg; j++) free(bufs[j]);
+                    free(bufs); free(jobs); return -1;
+                }
+                memcpy(d + o, bufs[k], jobs[k].outlen);
+                o += jobs[k].outlen;
+            }
+            for (uint32_t j = 0; j < n_seg; j++) free(bufs[j]);
+            free(bufs); free(jobs);
+            *dl = o;
+            return 0;
+        }
+        size_t o = 0;
+        for(uint32_t k = 0; k < n_seg; k++) {
+            uint32_t clen = (uint32_t)p[k*4] | ((uint32_t)p[k*4+1]<<8) | ((uint32_t)p[k*4+2]<<16) | ((uint32_t)p[k*4+3]<<24);
             size_t dl_k = h->original_size - o;
             if(dl_k > CPENC_SEG_SIZE) dl_k = CPENC_SEG_SIZE;
             if((size_t)*dl < o + dl_k) return -1;
