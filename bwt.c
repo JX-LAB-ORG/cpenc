@@ -1,93 +1,126 @@
 #include "bwt.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
-typedef struct { uint32_t idx, r1, r2; } Sfx;
-
-/* LSD radix on one 32-bit key field: low 16 bits first, then high 16
- * (high-first would be MSD, which needs bucket recursion — wrong here). */
-static void radix_pass(Sfx *a, Sfx *tmp, size_t n, int hi16) {
-    /* LSD order: low 16 bits first (stable), then high 16 bits. */
-    uint32_t cnt[65536];
-    memset(cnt, 0, sizeof(cnt));
-    for (size_t i = 0; i < n; i++) {
-        uint32_t v = hi16 ? (a[i].r1 & 0xFFFF) : (a[i].r2 & 0xFFFF);
-        cnt[v]++;
-    }
-    uint32_t sum = 0;
-    for (int i = 0; i < 65536; i++) { uint32_t c = cnt[i]; cnt[i] = sum; sum += c; }
-    for (size_t i = 0; i < n; i++) {
-        uint32_t v = hi16 ? (a[i].r1 & 0xFFFF) : (a[i].r2 & 0xFFFF);
-        tmp[cnt[v]++] = a[i];
-    }
-    memset(cnt, 0, sizeof(cnt));
-    for (size_t i = 0; i < n; i++) {
-        uint32_t v = hi16 ? (tmp[i].r1 >> 16) : (tmp[i].r2 >> 16);
-        cnt[v]++;
-    }
-    sum = 0;
-    for (int i = 0; i < 65536; i++) { uint32_t c = cnt[i]; cnt[i] = sum; sum += c; }
-    for (size_t i = 0; i < n; i++) {
-        uint32_t v = hi16 ? (tmp[i].r1 >> 16) : (tmp[i].r2 >> 16);
-        a[cnt[v]++] = tmp[i];
-    }
-}
-
-size_t bwt_enc(const uint8_t *s, size_t n, uint8_t *out) {
-    if (n == 0) return 0;
-    uint32_t *rank = malloc(n * sizeof(uint32_t));
-    uint32_t *nrank = malloc(n * sizeof(uint32_t));
-    Sfx *sfx = malloc(n * sizeof(Sfx));
-    Sfx *tmp = malloc(n * sizeof(Sfx));
-    for (size_t i = 0; i < n; i++) rank[i] = s[i];
-    for (size_t k = 1; k < n; k <<= 1) {
-        for (size_t i = 0; i < n; i++) {
-            sfx[i].idx = (uint32_t)i;
-            /* cyclic BWT (no EOF sentinel): n rows, LF-mapping decode is
-             * closed on the n-row table — the decoder depends on this */
-            sfx[i].r1 = rank[i];
-            sfx[i].r2 = rank[(i + k) % n];
+/* ── SA-IS: linear-time suffix array (Nong, Zhang, Chan 2009) ─────
+ * s[0..n-1] alphabet 0..k-1, implicit sentinel s[n]=0 (strictly minimal).
+ * Output sa[0..n] (n+1 suffixes; sa[0]=n is the sentinel suffix).
+ * Fallbacks: strictly-decreasing input → reverse order; non-decreasing
+ * recursion levels (equal chars) → insertion sort (small n only). */
+static void sais_impl(const int32_t *s, int32_t *sa, int n, int k) {
+    if (n <= 0) { sa[0] = 0; return; }
+    uint8_t *t = malloc((size_t)n + 1);
+    int32_t *bkt = malloc((size_t)(k + 1) * sizeof(int32_t));
+    int32_t *cnt = malloc((size_t)k * sizeof(int32_t));
+    t[n] = 1; t[n-1] = 0;
+    for (int i = n-2; i >= 0; i--)
+        t[i] = (s[i] < s[i+1] || (s[i] == s[i+1] && t[i+1])) ? 1 : 0;
+    memset(cnt, 0, (size_t)k * sizeof(int32_t));
+    for (int i = 0; i <= n; i++) cnt[s[i]]++;
+    bkt[0] = 0;
+    for (int i = 0; i < k; i++) bkt[i+1] = bkt[i] + cnt[i];
+    int nlms = 0;
+    int32_t *lms = malloc((size_t)n * sizeof(int32_t));
+    for (int i = 0; i < n; i++)
+        if (t[i] == 1 && (i == 0 || t[i-1] == 0)) lms[nlms++] = i;
+    if (nlms == 0) {
+        /* no LMS => monotone input: non-decreasing suffixes sort by
+         * position (each is a prefix of the next or smaller); otherwise
+         * strictly decreasing sorts reversed.  O(n), no insertion sort —
+         * the O(n^2) fallback exploded on large recursion levels. */
+        int non_dec = 1;
+        for (int i = 0; i + 1 < n; i++)
+            if (s[i] > s[i+1]) { non_dec = 0; break; }
+        if (non_dec) {
+            for (int i = 0; i < n; i++) sa[i+1] = (int32_t)i;
+        } else {
+            for (int i = 0; i < n; i++) sa[i+1] = n-1-i;
         }
-        radix_pass(sfx, tmp, n, 0);   /* LSB: r2 */
-        radix_pass(sfx, tmp, n, 1);   /* MSB: r1 */
-        uint32_t nr = 0;
-        for (size_t i = 0; i < n; i++) {
-            if (i > 0 && (sfx[i].r1 != sfx[i-1].r1 || sfx[i].r2 != sfx[i-1].r2)) nr++;
-            nrank[sfx[i].idx] = nr;
+        sa[0] = n;
+        free(t); free(bkt); free(cnt); free(lms);
+        return;
+    }
+    int32_t *cur = malloc((size_t)(k + 1) * sizeof(int32_t));
+    for (int i = 0; i <= n; i++) sa[i] = -1;
+    sa[0] = n;
+    for (int i = 0; i < k; i++) cur[i] = bkt[i+1];
+    for (int i = 0; i < nlms; i++) sa[--cur[s[lms[i]]]] = lms[i];
+    memcpy(cur, bkt, (size_t)(k+1) * sizeof(int32_t));
+    for (int i = 0; i <= n; i++) {
+        int32_t p = sa[i];
+        if (p > 0 && t[p-1] == 0) sa[cur[s[p-1]]++] = p-1;
+    }
+    for (int i = 0; i < k; i++) cur[i] = bkt[i+1];
+    for (int i = n; i >= 0; i--) {
+        int32_t p = sa[i];
+        if (p > 0 && t[p-1] == 1) sa[--cur[s[p-1]]] = p-1;
+    }
+    int32_t *lms_ord = malloc((size_t)nlms * sizeof(int32_t));
+    int c = 0;
+    for (int i = 0; i <= n; i++)
+        if (sa[i] >= 0 && sa[i] < n && t[sa[i]] == 1 &&
+            (sa[i] == 0 || t[sa[i]-1] == 0)) lms_ord[c++] = sa[i];
+    int32_t *name = malloc((size_t)n * sizeof(int32_t));
+    int names = 0;
+    int32_t prev = -1;
+    for (int i = 0; i < nlms; i++) {
+        int32_t p = lms_ord[i];
+        if (prev >= 0) {
+            int d = 0, eq = 1;
+            while (1) {
+                int isl_p = (d > 0) && (t[p+d] == 1 && (p+d == 0 || t[p+d-1] == 0));
+                int isl_q = (d > 0) && (t[prev+d] == 1 && (prev+d == 0 || t[prev+d-1] == 0));
+                if (isl_p && isl_q) break;
+                if (isl_p || isl_q) { eq = 0; break; }
+                if (s[p+d] != s[prev+d]) { eq = 0; break; }
+                if (t[p+d] != t[prev+d]) { eq = 0; break; }
+                d++;
+            }
+            if (!eq) names++;
         }
-        memcpy(rank, nrank, n * sizeof(uint32_t));
-        if (nr == n - 1) break;
+        name[p] = names;
+        prev = p;
     }
-    size_t orig = 0;
-    for (size_t i = 0; i < n; i++) {
-        if (sfx[i].idx == 0) orig = i;
-        out[i] = s[(sfx[i].idx + n - 1) % n];
+    int32_t *s2 = malloc((size_t)(nlms + 1) * sizeof(int32_t));
+    for (int i = 0; i < nlms; i++) s2[i] = name[lms[i]] + 1;
+    s2[nlms] = 0;
+    int32_t *sa2 = malloc((size_t)(nlms + 1) * sizeof(int32_t));
+    if (names + 1 < nlms) {
+        sais_impl(s2, sa2, nlms, names + 2);
+    } else {
+        for (int i = 0; i < nlms; i++) sa2[name[lms[i]] + 1] = i;
+        sa2[0] = nlms;
     }
-    free(rank); free(nrank); free(sfx); free(tmp);
-    return orig;
+    for (int i = 0; i <= n; i++) sa[i] = -1;
+    sa[0] = n;
+    for (int i = 0; i < k; i++) cur[i] = bkt[i+1];
+    for (int i = nlms; i >= 1; i--) {
+        int32_t p = lms[sa2[i]];
+        sa[--cur[s[p]]] = p;
+    }
+    memcpy(cur, bkt, (size_t)(k+1) * sizeof(int32_t));
+    for (int i = 0; i <= n; i++) {
+        int32_t p = sa[i];
+        if (p > 0 && t[p-1] == 0) sa[cur[s[p-1]]++] = p-1;
+    }
+    for (int i = 0; i < k; i++) cur[i] = bkt[i+1];
+    for (int i = n; i >= 0; i--) {
+        int32_t p = sa[i];
+        if (p > 0 && t[p-1] == 1) sa[--cur[s[p-1]]] = p-1;
+    }
+    free(t); free(bkt); free(cnt); free(cur);
+    free(lms); free(lms_ord); free(name); free(s2); free(sa2);
+}
+void sais_sa(const uint8_t *s, int32_t *sa, int n) {
+    int32_t *os = malloc(((size_t)n + 1) * sizeof(int32_t));
+    for (int i = 0; i < n; i++) os[i] = (int32_t)s[i] + 1;
+    os[n] = 0;
+    sais_impl(os, sa, n, 258);
+    free(os);
 }
 
-void bwt_dec(const uint8_t *b, size_t n, size_t orig_idx, uint8_t *out) {
-    /* precompute the LF table in one sequential pass (start[c]+occ[pos]),
-     * then the backward walk is a single table lookup per step instead of
-     * three dependent loads — LF dominates BWT decode time. */
-    uint32_t *cnt = calloc(256, sizeof(uint32_t));
-    for (size_t i = 0; i < n; i++) cnt[b[i]]++;
-    uint32_t start[256];
-    uint32_t sum = 0;
-    for (int i = 0; i < 256; i++) { start[i] = sum; sum += cnt[i]; }
-    uint32_t *lf = malloc(n * sizeof(uint32_t));
-    uint32_t cpos[256];
-    memcpy(cpos, start, sizeof(cpos));
-    for (size_t i = 0; i < n; i++) lf[i] = cpos[b[i]]++;
-    size_t pos = orig_idx;
-    for (size_t i = n; i-- > 0;) {
-        out[i] = b[pos];
-        pos = lf[pos];
-    }
-    free(cnt); free(lf);
-}
-
+/* ── MTF (move-to-front), bzip2-style: BWT clustering → zero runs ── */
 void mtf_enc_inplace(uint8_t *p, size_t n) {
     uint8_t st[256];
     for (int i = 0; i < 256; i++) st[i] = (uint8_t)i;
@@ -110,4 +143,48 @@ void mtf_dec_inplace(uint8_t *p, size_t n) {
         for (int j = r; j > 0; j--) st[j] = st[j-1];
         st[0] = v;
     }
+}
+
+/* ── BWT ─────────────────────────────────────────────────────────
+ * Cyclic BWT via linear SA on s+s: suffixes of the doubled string
+ * starting below n are exactly the cyclic rotations, in order.
+ * Decode is the closed LF mapping below. */
+size_t bwt_enc(const uint8_t *s, size_t n, uint8_t *out) {
+    if (n == 0) return 0;
+    if (n == 1) { out[0] = s[0]; return 0; }
+    size_t nn = 2 * n;
+    uint8_t *ss = malloc(nn);
+    memcpy(ss, s, n);
+    memcpy(ss + n, s, n);
+    int32_t *sa = malloc((nn + 1) * sizeof(int32_t));
+    sais_sa(ss, sa, nn);
+    size_t orig = 0, k = 0;
+    for (int32_t i = 1; i <= (int32_t)nn && k < n; i++) {
+        int32_t p = sa[i];
+        if (p >= 0 && p < (int32_t)n) {
+            if (p == 0) orig = k;
+            out[k++] = s[(p + n - 1) % n];
+        }
+    }
+    free(ss); free(sa);
+    return orig;
+}
+
+/* LF-mapping decode: precomputed table, one load per step. */
+void bwt_dec(const uint8_t *b, size_t n, size_t orig_idx, uint8_t *out) {
+    uint32_t *cnt = calloc(256, sizeof(uint32_t));
+    for (size_t i = 0; i < n; i++) cnt[b[i]]++;
+    uint32_t start[256];
+    uint32_t sum = 0;
+    for (int i = 0; i < 256; i++) { start[i] = sum; sum += cnt[i]; }
+    uint32_t *lf = malloc(n * sizeof(uint32_t));
+    uint32_t cpos[256];
+    memcpy(cpos, start, sizeof(cpos));
+    for (size_t i = 0; i < n; i++) lf[i] = cpos[b[i]]++;
+    size_t pos = orig_idx;
+    for (size_t i = n; i-- > 0;) {
+        out[i] = b[pos];
+        pos = lf[pos];
+    }
+    free(cnt); free(lf);
 }
