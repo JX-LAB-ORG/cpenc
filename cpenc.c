@@ -726,7 +726,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * (recursed with no_bwt=1 so it never re-enters this candidate). */
     if (!no_bwt && !hex_mode && sl >= 8192 && sl <= (1u<<20)) {
         double e = ent(s, 2048);
-        if (e > 4.5 && e < 7.2) {
+        if (e > 4.7 && e < 7.2) {
             uint8_t *bw = malloc(sl + 1);
             if (bw) {
                 size_t oi = bwt_enc(s, sl, bw);
