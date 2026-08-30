@@ -727,19 +727,19 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
     if (!no_bwt && !hex_mode && sl >= 8192 && sl <= (1u<<20)) {
         double e = ent(s, 2048);
         if (e > 4.5 && e < 7.2) {
-            uint8_t *bw = malloc(sl);
+            uint8_t *bw = malloc(sl + 1);
             if (bw) {
                 size_t oi = bwt_enc(s, sl, bw);
                 /* bzip2-style: MTF on the BWT stream turns its local
                  * clustering into long zero runs (RLE territory) */
-                mtf_enc_inplace(bw, sl);
+                mtf_enc_inplace(bw, sl + 1);
                 uint32_t bc[256] = {0};
-                for (size_t i = 0; i < sl; i++) bc[bw[i]]++;
-                double e1 = fq_ent(bc, sl);
+                for (size_t i = 0; i <= sl; i++) bc[bw[i]]++;
+                double e1 = fq_ent(bc, sl + 1);
                 if (e1 < e - 0.3 && *dl > CPENC_HEADER_SIZE + 4 + 64) {
                     size_t cl = *dl - (CPENC_HEADER_SIZE + 4);
                     uint8_t *op = d + CPENC_HEADER_SIZE + 4;
-                    if (cpenc_compress_impl(bw, sl, op, &cl, mo, 1) == 0 &&
+                    if (cpenc_compress_impl(bw, sl + 1, op, &cl, mo, 1) == 0 &&
                         cl + CPENC_HEADER_SIZE + 4 < (size_t)(e * sl / 8.0 * 1.05 + 96)) {
                         h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
                         h->stride = CPENC_STRIDE_BWT;
@@ -1349,13 +1349,17 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         uint32_t oi=(uint32_t)rp[0]|((uint32_t)rp[1]<<8)|((uint32_t)rp[2]<<16)|((uint32_t)rp[3]<<24);
         size_t pl = h->compressed_size - 4;
         if(pl > (size_t)(sl - CPENC_HEADER_SIZE - 4)) return -1;
-        uint8_t *bw = malloc(h->original_size);
+        uint8_t *bw = malloc(h->original_size + 1);
         if(!bw) return -2;
-        size_t outl = h->original_size;
+        size_t outl = h->original_size + 1;
         int rc = cpenc_decompress(rp + 4, pl, bw, &outl);
-        if(rc != 0 || outl != h->original_size){ free(bw); return -1; }
-        mtf_dec_inplace(bw, h->original_size);   /* undo MTF -> BWT stream */
-        bwt_dec(bw, h->original_size, oi, d);
+        if(rc != 0 || outl != h->original_size + 1){ free(bw); return -1; }
+        mtf_dec_inplace(bw, outl);               /* undo MTF -> BWT stream */
+        uint8_t *tmp = malloc(outl);
+        if(!tmp){ free(bw); return -2; }
+        bwt_dec(bw, outl, oi, tmp);              /* n+1 rows, EOF 0 first */
+        memcpy(d, tmp + 1, h->original_size);    /* strip the EOF symbol */
+        free(tmp);
         free(bw);
         *dl = h->original_size;
         return 0;

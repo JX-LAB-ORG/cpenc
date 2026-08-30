@@ -146,43 +146,38 @@ void mtf_dec_inplace(uint8_t *p, size_t n) {
 }
 
 /* ── BWT ─────────────────────────────────────────────────────────
- * Cyclic BWT via linear SA on s+s: suffixes of the doubled string
- * starting below n are exactly the cyclic rotations, in order.
- * Decode is the closed LF mapping below. */
+ * Linear BWT: suffix array of s (implicit EOF sentinel, from SA-IS).
+ * The L column has n+1 rows: out[i] = predecessor of suffix sa[i],
+ * where the row sa[i]==0 (the original string's start) carries the
+ * EOF symbol 0.  out has n+1 entries; decode emits n+1 (last is EOF)
+ * and the caller strips the 0.  Sorting half the length of the cyclic
+ * s+s trick — the previous scheme ran SA-IS on 2n bytes. */
 size_t bwt_enc(const uint8_t *s, size_t n, uint8_t *out) {
-    if (n == 0) return 0;
-    if (n == 1) { out[0] = s[0]; return 0; }
-    size_t nn = 2 * n;
-    uint8_t *ss = malloc(nn);
-    memcpy(ss, s, n);
-    memcpy(ss + n, s, n);
-    int32_t *sa = malloc((nn + 1) * sizeof(int32_t));
-    sais_sa(ss, sa, nn);
-    size_t orig = 0, k = 0;
-    for (int32_t i = 1; i <= (int32_t)nn && k < n; i++) {
+    if (n == 0) { out[0] = 0; return 0; }
+    int32_t *sa = malloc((n + 1) * sizeof(int32_t));
+    sais_sa(s, sa, n);
+    for (int32_t i = 0; i <= (int32_t)n; i++) {
         int32_t p = sa[i];
-        if (p >= 0 && p < (int32_t)n) {
-            if (p == 0) orig = k;
-            out[k++] = s[(p + n - 1) % n];
-        }
+        out[i] = (p == 0) ? 0 : s[p - 1];
     }
-    free(ss); free(sa);
-    return orig;
+    free(sa);
+    return 0;   /* EOF row is always sa[0] */
 }
 
-/* LF-mapping decode: precomputed table, one load per step. */
-void bwt_dec(const uint8_t *b, size_t n, size_t orig_idx, uint8_t *out) {
+/* LF-mapping decode of the n+1-row linear BWT; output is n+1 bytes
+ * with the EOF symbol at the last emitted position. */
+void bwt_dec(const uint8_t *b, size_t n1, size_t orig_idx, uint8_t *out) {
     uint32_t *cnt = calloc(256, sizeof(uint32_t));
-    for (size_t i = 0; i < n; i++) cnt[b[i]]++;
+    for (size_t i = 0; i < n1; i++) cnt[b[i]]++;
     uint32_t start[256];
     uint32_t sum = 0;
     for (int i = 0; i < 256; i++) { start[i] = sum; sum += cnt[i]; }
-    uint32_t *lf = malloc(n * sizeof(uint32_t));
+    uint32_t *lf = malloc(n1 * sizeof(uint32_t));
     uint32_t cpos[256];
     memcpy(cpos, start, sizeof(cpos));
-    for (size_t i = 0; i < n; i++) lf[i] = cpos[b[i]]++;
-    size_t pos = orig_idx;
-    for (size_t i = n; i-- > 0;) {
+    for (size_t i = 0; i < n1; i++) lf[i] = cpos[b[i]]++;
+    size_t pos = orig_idx;                    /* EOF row: sa[0] */
+    for (size_t i = n1; i-- > 0;) {
         out[i] = b[pos];
         pos = lf[pos];
     }
