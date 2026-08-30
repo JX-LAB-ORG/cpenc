@@ -1,4 +1,5 @@
 #include "cpenc.h"
+#include "bwt.h"
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -539,7 +540,7 @@ size_t cpenc_max_compressed_size(size_t sl) {
     return CPENC_HEADER_SIZE+16+sl+sl/2+16384;
 }
 
-int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
+int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo, int no_bwt) {
     lg2_init();
     const uint8_t *s=(const uint8_t*)sv; uint8_t *d=(uint8_t*)dv;
     CPEncHeader *h=(CPEncHeader*)d;
@@ -700,7 +701,7 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                 size_t seg_len = sl - seg_off;
                 if (seg_len > CPENC_SEG_SIZE) seg_len = CPENC_SEG_SIZE;
                 size_t clen = (size_t)(*dl - (op - d));
-                if (cpenc_compress(s + seg_off, seg_len, op, &clen, mo) != 0) {
+                if (cpenc_compress_impl(s + seg_off, seg_len, op, &clen, mo, 0) != 0) {
                     free(hexbuf); return -1;
                 }
                 lenp[k * 4 + 0] = (uint8_t)(clen & 0xFF);
@@ -716,6 +717,48 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
         return 0;
     }
 
+    /* v6: BWT candidate — reorder so context-similar bytes are adjacent,
+     * then the lag/stride machinery eats the order-1 structure ("BWT is
+     * the delta aligner").  Archive-oriented: sort is slow (~3MB/s), the
+     * LF-mapping decode is O(n).  Mid-entropy blocks only; structured
+     * (<4.5) and random (>7.2) data skip — entropy gate is the cost cap.
+     * Format: [orig_idx u32][payload] where payload = compressed BWT stream
+     * (recursed with no_bwt=1 so it never re-enters this candidate). */
+    if (!no_bwt && !hex_mode && sl >= 8192 && sl <= (1u<<20)) {
+        double e = ent(s, 2048);
+        if (e > 4.5 && e < 7.2) {
+            uint8_t *bw = malloc(sl);
+            if (bw) {
+                size_t oi = bwt_enc(s, sl, bw);
+                /* bzip2-style: MTF on the BWT stream turns its local
+                 * clustering into long zero runs (RLE territory) */
+                mtf_enc_inplace(bw, sl);
+                uint32_t bc[256] = {0};
+                for (size_t i = 0; i < sl; i++) bc[bw[i]]++;
+                double e1 = fq_ent(bc, sl);
+                if (e1 < e - 0.3 && *dl > CPENC_HEADER_SIZE + 4 + 64) {
+                    size_t cl = *dl - (CPENC_HEADER_SIZE + 4);
+                    uint8_t *op = d + CPENC_HEADER_SIZE + 4;
+                    if (cpenc_compress_impl(bw, sl, op, &cl, mo, 1) == 0 &&
+                        cl + CPENC_HEADER_SIZE + 4 < (size_t)(e * sl / 8.0 * 1.05 + 96)) {
+                        h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
+                        h->stride = CPENC_STRIDE_BWT;
+                        h->original_size = (uint32_t)sl;
+                        h->compressed_size = (uint32_t)(cl + 4);
+                        d[CPENC_HEADER_SIZE+0] = (uint8_t)oi;
+                        d[CPENC_HEADER_SIZE+1] = (uint8_t)(oi>>8);
+                        d[CPENC_HEADER_SIZE+2] = (uint8_t)(oi>>16);
+                        d[CPENC_HEADER_SIZE+3] = (uint8_t)(oi>>24);
+                        *dl = CPENC_HEADER_SIZE + 4 + cl;
+                        free(bw);
+                        return 0;
+                    }
+                }
+                free(bw);
+            }
+        }
+    }
+
     /* v3: lag-delta preprocessing — catches fixed-frame periodicity
      * (log rows, protocol frames, config tables).  Coarse scan (every 16)
      * then fine scan around the best; high-entropy segments skip entirely
@@ -726,9 +769,15 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
         size_t k = sl < 8192 ? sl : 8192;
         double best_e = ent(s, k);
         int best_p = 0;
-        /* near-uniform (>6.0) or near-constant (<1.0) segments have no
-         * frame periodicity worth scanning for */
+        /* zero-dense streams (BWT+MTF output, sparse data): a lag diff only
+         * pollutes — 0 - nonzero wraps to 255 spikes (measured).  Skip the
+         * scan entirely; the 0-run machinery handles these. */
         if (best_e > 1.0 && best_e < 6.0) {
+            uint32_t zc = 0;
+            for (size_t i = 0; i < k; i++) if (!s[i]) zc++;
+            if (zc * 2 <= k) {
+            /* near-uniform (>6.0) or near-constant (<1.0) segments have no
+             * frame periodicity worth scanning for */
             /* coarse: 16 candidates instead of 240, small sample (frame
              * periods 16..255 are visible in 2048 bytes) */
             size_t kc = k < 2048 ? k : 2048;
@@ -758,6 +807,7 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
                     double h = fq_ent(c, kf);
                     if (h < best_e - 0.05) { best_e = h; lag_idx = p; }
                 }
+            }
             }
         }
     }
@@ -903,13 +953,18 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
             /* RLE candidate (tag 4): zero-heavy groups get run-length coded.
              * Strict alternation: zero-run then value; consecutive nonzeros
              * are separated by run=0.  Runs are 8-bit with 255 = continuation.
-             * Estimate cheaply from the histogram (no stream build): non-zero
-             * bytes nv produce at most ~2nv+1 runs; sub-blocks RAW-sized. */
-            if(fq[0] > (uint32_t)gs*9/10 && gs >= 64){
+             * Threshold lowered to 50% so BWT+MTF streams (0 ~57-70%, long
+             * runs) qualify; run count is scanned (cheap, only for zero-heavy
+             * groups) because the alternating-stream bound 2nv+1 overestimates
+             * clustered zeros by ~5x and would steer them to Huffman. */
+            if(fq[0] > (uint32_t)gs/2 && gs >= 64){
                 size_t nv = (size_t)gs - fq[0];
-                size_t nr_est = 2*nv + 1;
-                size_t sz_rle = 2 + (4 + nr_est + nr_est/5) + (4 + nv);
-                    if(sz_rle<sz_best){tag=4;}
+                size_t nr = 0; int inz = 0;
+                for (size_t i2 = 0; i2 < gs; i2++) {
+                    if (!gp[i2]) { if (!inz) { nr++; inz = 1; } }
+                    else inz = 0;
+                }
+                size_t sz_rle = 2 + (4 + nr + nr/5) + (4 + nv);
                 if(sz_rle<sz_best){tag=4;}
             }
         }
@@ -1274,6 +1329,24 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         free(tmp);
         return 0;
     }
+    if(h->stride==CPENC_STRIDE_BWT){
+        if(sl < CPENC_HEADER_SIZE+4) return -1;
+        const uint8_t *rp = s + CPENC_HEADER_SIZE;
+        uint32_t oi=(uint32_t)rp[0]|((uint32_t)rp[1]<<8)|((uint32_t)rp[2]<<16)|((uint32_t)rp[3]<<24);
+        size_t pl = h->compressed_size - 4;
+        if(pl > (size_t)(sl - CPENC_HEADER_SIZE - 4)) return -1;
+        uint8_t *bw = malloc(h->original_size);
+        if(!bw) return -2;
+        size_t outl = h->original_size;
+        int rc = cpenc_decompress(rp + 4, pl, bw, &outl);
+        if(rc != 0 || outl != h->original_size){ free(bw); return -1; }
+        mtf_dec_inplace(bw, h->original_size);   /* undo MTF -> BWT stream */
+        bwt_dec(bw, h->original_size, oi, d);
+        free(bw);
+        *dl = h->original_size;
+        return 0;
+    }
+
     if(h->stride==CPENC_STRIDE_RAW){
         if(h->original_size==0){*dl=0;return 0;}
         if(*dl<h->original_size) return -1;
@@ -1524,4 +1597,8 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         for(size_t i=(size_t)lag_idx;i<orig;i++) d[i]+=d[i-(size_t)lag_idx];
     }
     *dl=orig; return 0;
+}
+
+int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
+    return cpenc_compress_impl(sv, sl, dv, dl, mo, 0);
 }
