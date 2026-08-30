@@ -893,10 +893,10 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
             {
                 uint32_t dom = 0;
                 for (int i2 = 0; i2 < 256; i2++) if (fq[i2] > dom) { dom = fq[i2]; }
-                if (dom > (uint32_t)gs - gs/100 && dom < (uint32_t)gs && gs >= 1024) {
-                    /* estimate: const byte + count(4) + LEB128 pos (avg 4B) + value */
+                if (dom > (uint32_t)gs - gs/10 && dom < (uint32_t)gs && gs >= 1024) {
+                    /* estimate: cval(2) + count(4) + gap-LEB128 pos (avg 2B) + value */
                     uint32_t nex = (uint32_t)gs - dom;
-                    size_t sz_c = 6 + (size_t)nex*5;
+                    size_t sz_c = 6 + (size_t)nex*3;
                     if (sz_c < sz_best) { tag = 5; }
                 }
             }
@@ -1054,13 +1054,19 @@ int cpenc_compress(const void *sv, size_t sl, void *dv, size_t *dl, int mo) {
             if (out+6 > edd){free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
             *out++=(uint8_t)(domv2&0xFF);*out++=(uint8_t)(domv2>>8);
             *out++=nex&0xFF;*out++=(nex>>8)&0xFF;*out++=(nex>>16)&0xFF;*out++=nex>>24;
-            /* exception positions (absolute) LEB128 + values */
+            /* exception positions: first absolute, then gaps (avg gap is
+             * small for zero-dominated data — 1 LEB128 byte vs 3-4 for
+             * absolute) */
+            uint32_t prev = 0;
+            int first = 1;
             for (size_t i2 = 0; i2 < gs; i2++) {
                 if (gp[i2] != (uint8_t)domv2) {
                     uint32_t pos = (uint32_t)i2;
+                    uint32_t enc = first ? pos : (pos - prev - 1);
+                    first = 0; prev = pos;
                     uint8_t lb[4]; int ln = 0;
-                    do { lb[ln++] = (uint8_t)(pos & 0x7F); pos >>= 7;
-                         if (pos) lb[ln-1] |= 0x80; } while (pos);
+                    do { lb[ln++] = (uint8_t)(enc & 0x7F); enc >>= 7;
+                         if (enc) lb[ln-1] |= 0x80; } while (enc);
                     for (int b2 = 0; b2 < ln; b2++) { if (out >= edd){free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;} *out++ = lb[b2]; }
                     if (out >= edd){free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
                     *out++ = gp[i2];
@@ -1362,15 +1368,17 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             uint32_t nex=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
             if(nex>gs){if(stride>1)free(trans);return-1;}
             memset(gp,cval,gs);
+            uint32_t pos=0;
             for(uint32_t k=0;k<nex;k++){
-                uint32_t pos=0,shift=0;
+                uint32_t gap=0,shift=0;
                 for(;;){
                     if(p>=edd){if(stride>1)free(trans);return-1;}
                     uint8_t b=*p++;
-                    pos|=(uint32_t)(b&0x7F)<<shift;
+                    gap|=(uint32_t)(b&0x7F)<<shift;
                     if(!(b&0x80))break;
                     shift+=7;
                 }
+                pos = (k == 0) ? gap : (pos + 1 + gap);
                 if(p>=edd||pos>=gs){if(stride>1)free(trans);return-1;}
                 gp[pos]=*p++;
             }
