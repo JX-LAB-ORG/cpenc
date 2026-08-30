@@ -68,18 +68,24 @@ size_t bwt_enc(const uint8_t *s, size_t n, uint8_t *out) {
 }
 
 void bwt_dec(const uint8_t *b, size_t n, size_t orig_idx, uint8_t *out) {
+    /* precompute the LF table in one sequential pass (start[c]+occ[pos]),
+     * then the backward walk is a single table lookup per step instead of
+     * three dependent loads — LF dominates BWT decode time. */
     uint32_t *cnt = calloc(256, sizeof(uint32_t));
-    uint32_t *occ = malloc(n * sizeof(uint32_t));
-    for (size_t i = 0; i < n; i++) occ[i] = cnt[b[i]]++;
+    for (size_t i = 0; i < n; i++) cnt[b[i]]++;
     uint32_t start[256];
     uint32_t sum = 0;
     for (int i = 0; i < 256; i++) { start[i] = sum; sum += cnt[i]; }
+    uint32_t *lf = malloc(n * sizeof(uint32_t));
+    uint32_t cpos[256];
+    memcpy(cpos, start, sizeof(cpos));
+    for (size_t i = 0; i < n; i++) lf[i] = cpos[b[i]]++;
     size_t pos = orig_idx;
     for (size_t i = n; i-- > 0;) {
         out[i] = b[pos];
-        pos = start[b[pos]] + occ[pos];
+        pos = lf[pos];
     }
-    free(cnt); free(occ);
+    free(cnt); free(lf);
 }
 
 void mtf_enc_inplace(uint8_t *p, size_t n) {
