@@ -644,7 +644,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * each compressed independently as a sub-block (own lag/stride/tags);
      * segment lengths make the stream self-delimiting.  Segments smaller
      * than the threshold recurse as plain single-block calls. */
-    if (sl >= CPENC_SEG_MIN) {
+    if (sl >= CPENC_SEG_MIN && ent(s, 2048) >= 1.0) {
         size_t n_seg = (sl + CPENC_SEG_SIZE - 1) / CPENC_SEG_SIZE;
         size_t ext = hex_mode ? 1 : 0;      /* real-stride byte for hex wrapper */
         size_t need = CPENC_HEADER_SIZE + ext + 4 + n_seg * 4;
