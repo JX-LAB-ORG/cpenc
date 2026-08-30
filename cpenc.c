@@ -926,6 +926,11 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
          * the bitstream floor is gs/8 bytes, not gs/32 (was badly
          * underestimating skewed groups, steering them to Huffman) */
         size_t h_p=(size_t)(gs*gp_ent/8.0);if(h_p<gs/8)h_p=gs/8;
+        /* zero-dense groups (BWT+MTF output, sparse): Huffman's actual code
+         * length runs ~1.75x the entropy floor — the 0 gets 1 bit but the
+         * long tail of sparse ranks eats the rest.  Without this, Huffman
+         * estimate beats RLE and loses ~2x ratio (measured on MTF streams). */
+        if (fq[0] > (uint32_t)gs/2) h_p = h_p * 175 / 100;
         size_t sz_h=264+h_p*103/100+16;
 
         if(nz<=1){tag=0;}
@@ -964,7 +969,16 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                     if (!gp[i2]) { if (!inz) { nr++; inz = 1; } }
                     else inz = 0;
                 }
-                size_t sz_rle = 2 + (4 + nr + nr/5) + (4 + nv);
+                /* value sub-stream gets its own tag; entropy of the nonzero
+                 * symbols (RAW sizing overestimated it ~40% on MTF streams,
+                 * steering RLE to Huffman) */
+                double ve = 0;
+                if (nv) {
+                    for (int i2 = 1; i2 < 256; i2++)
+                        if (fq[i2]) { double pr = (double)fq[i2]/nv; ve -= pr*log2(pr); }
+                }
+                size_t v_est = 264 + (size_t)(nv*ve/8.0*103/100) + 16;
+                size_t sz_rle = 2 + (4 + nr + nr/5) + (4 + v_est);
                 if(sz_rle<sz_best){tag=4;}
             }
         }
