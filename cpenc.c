@@ -717,47 +717,12 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         return 0;
     }
 
-    /* v6: BWT candidate — reorder so context-similar bytes are adjacent,
-     * then the lag/stride machinery eats the order-1 structure ("BWT is
-     * the delta aligner").  Archive-oriented: sort is slow (~3MB/s), the
-     * LF-mapping decode is O(n).  Mid-entropy blocks only; structured
-     * (<4.5) and random (>7.2) data skip — entropy gate is the cost cap.
-     * Format: [orig_idx u32][payload] where payload = compressed BWT stream
-     * (recursed with no_bwt=1 so it never re-enters this candidate). */
-    if (!no_bwt && !hex_mode && sl >= 8192 && sl <= (1u<<20)) {
-        double e = ent(s, 2048);
-        if (e > 4.7 && e < 7.2) {
-            uint8_t *bw = malloc(sl + 1);
-            if (bw) {
-                size_t oi = bwt_enc(s, sl, bw);
-                /* bzip2-style: MTF on the BWT stream turns its local
-                 * clustering into long zero runs (RLE territory) */
-                mtf_enc_inplace(bw, sl + 1);
-                uint32_t bc[256] = {0};
-                for (size_t i = 0; i <= sl; i++) bc[bw[i]]++;
-                double e1 = fq_ent(bc, sl + 1);
-                if (e1 < e - 0.3 && *dl > CPENC_HEADER_SIZE + 4 + 64) {
-                    size_t cl = *dl - (CPENC_HEADER_SIZE + 4);
-                    uint8_t *op = d + CPENC_HEADER_SIZE + 4;
-                    if (cpenc_compress_impl(bw, sl + 1, op, &cl, mo, 1) == 0 &&
-                        cl + CPENC_HEADER_SIZE + 4 < (size_t)(e * sl / 8.0 * 1.05 + 96)) {
-                        h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
-                        h->stride = CPENC_STRIDE_BWT;
-                        h->original_size = (uint32_t)sl;
-                        h->compressed_size = (uint32_t)(cl + 4);
-                        d[CPENC_HEADER_SIZE+0] = (uint8_t)oi;
-                        d[CPENC_HEADER_SIZE+1] = (uint8_t)(oi>>8);
-                        d[CPENC_HEADER_SIZE+2] = (uint8_t)(oi>>16);
-                        d[CPENC_HEADER_SIZE+3] = (uint8_t)(oi>>24);
-                        *dl = CPENC_HEADER_SIZE + 4 + cl;
-                        free(bw);
-                        return 0;
-                    }
-                }
-                free(bw);
-            }
-        }
-    }
+    /* (v6 BWT candidate moved to the end of this function: it is only
+     * worth taking when it actually beats the main path — see the note
+     * there.  It must run on the ORIGINAL bytes, so keep them: the lag
+     * pass below rebinds `s` to the differenced buffer, and the BWT
+     * decode path has no un-diff step.) */
+    const uint8_t *s_bwt = s;
 
     /* v3: lag-delta preprocessing — catches fixed-frame periodicity
      * (log rows, protocol frames, config tables).  Coarse scan (every 16)
@@ -1198,6 +1163,82 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             out += rem;
         }
     }
+    /* v6: BWT candidate — reorder so context-similar bytes are adjacent,
+     * then the lag/stride machinery eats the order-1 structure ("BWT is
+     * the delta aligner").  Built AFTER the main path and kept only if it
+     * is strictly smaller: a byte-entropy bound is a poor proxy for what
+     * delta+transpose already achieves (a structured u32 table has raw
+     * byte entropy ~7.1 but collapses to a few hundred bytes), and
+     * accepting on that bound lost 317x -> 68x.  Archive-oriented: the
+     * sort is slow, so it must earn its place.
+     * Format: [eof_row u32][payload], payload = compressed BWT stream
+     * (recursed with no_bwt=1 so it never re-enters this candidate). */
+    if (!no_bwt && !hex_mode && sl >= 8192 && sl <= (1u<<20)) {
+        double e = ent(s_bwt, 2048);
+        size_t main_len = (size_t)(out - d);
+        /* Two cheap gates before paying for the sort (~4ms per 64KB):
+         *  - main_len*8 > sl: BWT tops out around 4-5x, so when the main
+         *    path already beats 8x the sort cannot pay for itself (keeps
+         *    structured tables at 317x instead of sorting to reject).
+         *  - probe: sort a 4KB sample and require MTF to actually
+         *    collapse it.  f32-style data passes the entropy window on
+         *    ~248 of 256 segments and loses every one of them; the probe
+         *    rejects those at 1/16th the sort cost (measured MTF drop:
+         *    text +2.85, f32 -0.12 — a clean separation the entropy
+         *    window cannot make, since their per-segment byte entropies
+         *    overlap at 5.1-6.1). */
+        if (e > 4.7 && e < 7.2 && main_len > CPENC_HEADER_SIZE + 4 + 64 &&
+            main_len * 8 > sl) {
+            size_t pn = sl < 4096 ? sl : 4096;
+            uint8_t *pb = malloc(pn + 1);
+            int probe_ok = 0;
+            if (pb) {
+                bwt_enc(s_bwt, pn, pb);
+                mtf_enc_inplace(pb, pn + 1);
+                uint32_t pc[256] = {0};
+                for (size_t i = 0; i <= pn; i++) pc[pb[i]]++;
+                probe_ok = (fq_ent(pc, pn + 1) < ent(s_bwt, pn) - 0.3);
+                free(pb);
+            }
+            uint8_t *bw = probe_ok ? malloc(sl + 1) : NULL;
+            if (bw) {
+                size_t oi = bwt_enc(s_bwt, sl, bw);
+                /* bzip2-style: MTF on the BWT stream turns its local
+                 * clustering into long zero runs (RLE territory) */
+                mtf_enc_inplace(bw, sl + 1);
+                /* The inner call's per-group capacity checks are upper
+                 * bounds (gs*bits/8), so it needs the full worst-case
+                 * buffer to run at all — sizing this at main_len made it
+                 * bail with -1 and silently dropped every BWT win. */
+                size_t bcap = cpenc_max_compressed_size(sl + 1) + 64;
+                uint8_t *bb = malloc(bcap);
+                if (bb) {
+                    size_t cl = bcap - (CPENC_HEADER_SIZE + 4);
+                    if (cpenc_compress_impl(bw, sl + 1, bb + CPENC_HEADER_SIZE + 4,
+                                            &cl, mo, 1) == 0 &&
+                        CPENC_HEADER_SIZE + 4 + cl < main_len) {
+                        CPEncHeader *bh = (CPEncHeader *)bb;
+                        bh->magic = CPENC_MAGIC; bh->version = CPENC_VERSION;
+                        bh->stride = CPENC_STRIDE_BWT;
+                        bh->original_size = (uint32_t)sl;
+                        bh->compressed_size = (uint32_t)(cl + 4);
+                        bb[CPENC_HEADER_SIZE+0] = (uint8_t)oi;
+                        bb[CPENC_HEADER_SIZE+1] = (uint8_t)(oi>>8);
+                        bb[CPENC_HEADER_SIZE+2] = (uint8_t)(oi>>16);
+                        bb[CPENC_HEADER_SIZE+3] = (uint8_t)(oi>>24);
+                        memcpy(d, bb, CPENC_HEADER_SIZE + 4 + cl);
+                        *dl = CPENC_HEADER_SIZE + 4 + cl;
+                        free(bb); free(bw);
+                        free(trial); free(trans); free(hexbuf);
+                        return 0;
+                    }
+                    free(bb);
+                }
+                free(bw);
+            }
+        }
+    }
+
     h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(out-(d+CPENC_HEADER_SIZE));
     *dl=(size_t)(out-d); free(trial); free(trans); free(hexbuf); return 0;
 }
