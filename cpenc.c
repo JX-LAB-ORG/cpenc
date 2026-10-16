@@ -315,6 +315,16 @@ static int sub5_decode(const uint8_t **pp, const uint8_t *edd, uint8_t *out,
  * Greedy parse with a 64K-entry hash chain; distances therefore cap at
  * the chain window, which is ample for line-level repeats. */
 #define LZ_MINM   4
+/* Approximate match ("base + exceptions"): a base that is nearly, not
+ * exactly, equal — the log/record case where a long body repeats with a
+ * few fields changed.  Only taken when the base is long and the
+ * differences sparse; on short lines (where exact matching already
+ * decomposes the template into matches plus literals) merging costs more
+ * than it saves and steals the anchors later matches need.  Measured:
+ * 1KB records +23%, 2KB records +65%; logs and text unchanged. */
+#define LZ_MAXMIS  8
+#define LZ_APPMIN  128
+#define LZ_APPDIV  64
 #define LZ_HBITS  16
 #define LZ_HSZ    (1u << LZ_HBITS)
 #define LZ_HMASK  (LZ_HSZ - 1)
@@ -329,6 +339,7 @@ static int leb_put(uint8_t *p, uint32_t v) {
     do { uint8_t b = (uint8_t)(v & 0x7F); v >>= 7; if (v) b |= 0x80; p[n++] = b; } while (v);
     return n;
 }
+static int leb_len(uint32_t v) { int n = 1; while (v >= 128) { v >>= 7; n++; } return n; }
 /* Returns token-stream length, or 0 if the block is not worth matching. */
 static size_t lz_encode(const uint8_t *s, size_t n, uint8_t *t, size_t cap) {
     if (n < 256) return 0;
@@ -354,6 +365,34 @@ static size_t lz_encode(const uint8_t *s, size_t n, uint8_t *t, size_t cap) {
             }
         }
         if (best >= LZ_MINM) {
+            /* extend the base with a few mismatches -> base + patches */
+            size_t alen = 0; int ane = 0;
+            uint32_t aeoff[LZ_MAXMIS]; uint8_t aeval[LZ_MAXMIS];
+            if (bestd) {
+                size_t c = i - bestd, k = 0, lastgood = 0; int ne = 0;
+                while (i + k < n && c + k < i) {
+                    if (s[i + k] == s[c + k]) { k++; lastgood = k; }
+                    else {
+                        if (ne >= LZ_MAXMIS) break;
+                        aeoff[ne] = (uint32_t)k; aeval[ne] = s[i + k]; ne++; k++;
+                    }
+                }
+                while (ne > 0 && aeoff[ne - 1] >= lastgood) ne--;   /* trailing
+                    * mismatches would be literals anyway — drop them */
+                if (lastgood >= LZ_APPMIN && (size_t)ne * LZ_APPDIV < lastgood) {
+                    alen = lastgood; ane = ne;
+                }
+            }
+            long cex = 1 + leb_len((uint32_t)bestd) + leb_len((uint32_t)best);
+            long capx = 0;
+            if (alen) {
+                capx = 1 + leb_len((uint32_t)bestd) + leb_len((uint32_t)alen) + leb_len((uint32_t)ane);
+                uint32_t prev = 0;
+                for (int k = 0; k < ane; k++) { capx += leb_len(aeoff[k] - prev) + 1; prev = aeoff[k]; }
+            }
+            int use_ap = (alen && (long)alen - capx > (long)best - cex);
+            size_t mlen = use_ap ? alen : (size_t)best;
+
             size_t ll = i - lit0;
             if (ll) {
                 if (ti + 1 + 5 + ll > cap) { fail = 1; break; }
@@ -361,19 +400,32 @@ static size_t lz_encode(const uint8_t *s, size_t n, uint8_t *t, size_t cap) {
                 ti += (size_t)leb_put(t + ti, (uint32_t)ll);
                 memcpy(t + ti, s + lit0, ll); ti += ll;
             }
-            if (ti + 1 + 5 + 5 > cap) { fail = 1; break; }
-            t[ti++] = 1;
-            ti += (size_t)leb_put(t + ti, (uint32_t)best);
-            ti += (size_t)leb_put(t + ti, (uint32_t)bestd);
-            for (int k = 0; k < best; k++) {
-                size_t p = i + (size_t)k;
+            if (ti + 1 + 5 + 5 + 5 + (size_t)ane * 6 > cap) { fail = 1; break; }
+            if (use_ap) {
+                t[ti++] = 2;
+                ti += (size_t)leb_put(t + ti, (uint32_t)alen);
+                ti += (size_t)leb_put(t + ti, (uint32_t)bestd);
+                ti += (size_t)leb_put(t + ti, (uint32_t)ane);
+                uint32_t prev = 0;
+                for (int k = 0; k < ane; k++) {
+                    ti += (size_t)leb_put(t + ti, aeoff[k] - prev);
+                    t[ti++] = aeval[k];
+                    prev = aeoff[k];
+                }
+            } else {
+                t[ti++] = 1;
+                ti += (size_t)leb_put(t + ti, (uint32_t)best);
+                ti += (size_t)leb_put(t + ti, (uint32_t)bestd);
+            }
+            for (size_t k = 0; k < mlen; k++) {
+                size_t p = i + k;
                 if (p + LZ_MINM <= n) {
                     uint32_t hh = lz_h4(s + p);
                     chain[p & LZ_HMASK] = head[hh];
                     head[hh] = (int32_t)p;
                 }
             }
-            i += (size_t)best; lit0 = i;
+            i += mlen; lit0 = i;
         } else {
             if (i + LZ_MINM <= n) {
                 uint32_t hh = lz_h4(s + i);
@@ -412,7 +464,7 @@ static int lz_decode(const uint8_t *t, size_t tn, uint8_t *out, size_t outn) {
         if (tag == 0) {
             if (ti + len > tn || o + len > outn) return -1;
             memcpy(out + o, t + ti, len); o += len; ti += len;
-        } else if (tag == 1) {
+        } else if (tag == 1 || tag == 2) {
             uint32_t dist = 0; sh = 0;
             for (;;) {
                 if (ti >= tn || sh > 28) return -1;
@@ -423,10 +475,90 @@ static int lz_decode(const uint8_t *t, size_t tn, uint8_t *out, size_t outn) {
             }
             if (!dist || dist > o || o + len > outn) return -1;
             for (uint32_t k = 0; k < len; k++) out[o + k] = out[o + k - dist];
+            if (tag == 2) {
+                uint32_t nex = 0; sh = 0;
+                for (;;) {
+                    if (ti >= tn || sh > 28) return -1;
+                    uint8_t b = t[ti++];
+                    nex |= (uint32_t)(b & 0x7F) << sh;
+                    if (!(b & 0x80)) break;
+                    sh += 7;
+                }
+                uint32_t prev = 0;
+                for (uint32_t e = 0; e < nex; e++) {
+                    uint32_t gap = 0; sh = 0;
+                    for (;;) {
+                        if (ti >= tn || sh > 28) return -1;
+                        uint8_t b = t[ti++];
+                        gap |= (uint32_t)(b & 0x7F) << sh;
+                        if (!(b & 0x80)) break;
+                        sh += 7;
+                    }
+                    prev += gap;
+                    if (prev >= len || ti >= tn) return -1;
+                    out[o + prev] = t[ti++];
+                }
+            }
             o += len;
         } else return -1;
     }
     return (o == outn) ? 0 : -1;
+}
+
+int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl,
+                        int mo, int no_bwt, int no_lz);
+
+/* Try the match layer against base_len (the best size so far).  On a win
+ * it writes the whole block into d and returns its length, else 0.
+ * Called from two places: the RAW passthrough needs it too, because
+ * records that differ in a few scattered bytes look like noise to
+ * delta/BWT and fall back to RAW — returning there meant the candidate
+ * never ran and 1KB-record data stored at 1.00x instead of 57x. */
+static size_t lz_try(const uint8_t *s, size_t sl, uint8_t *d, size_t cap,
+                     size_t base_len, int mo) {
+    if (sl < 4096) return 0;
+    if (base_len * 4 <= sl) return 0;          /* main path already beats 4x */
+    size_t tcap = sl + sl / 64 + 64;
+    uint8_t *tok = malloc(tcap);
+    if (!tok) return 0;
+    /* Probe the first 32KB before matching the whole block: data with no
+     * repeats (random bytes, float noise) would otherwise pay a full pass
+     * for nothing — measured 95 -> 2.9 MB/s on random at block size 8MB.
+     * The probe is 0.4% of an 8MB block and directly measures what the
+     * decision depends on. */
+    {
+        size_t pn = sl < 32768 ? sl : 32768;
+        if (pn < 4096) { free(tok); return 0; }
+        size_t pt = lz_encode(s, pn, tok, tcap);
+        if (getenv("LZDBG")) fprintf(stderr,"[probe] sl=%zu pn=%zu pt=%zu ratio=%.2f\n",sl,pn,pt,(double)pn/(pt?pt:1));
+        if (!pt || pt * 13 > pn * 10) { free(tok); return 0; }   /* under 1.3x on the
+            * sample: the full pass cannot pay for itself */
+    }
+    size_t tn = lz_encode(s, sl, tok, tcap);
+    size_t res = 0;
+    if (tn && tn < sl) {
+        size_t bcap = cpenc_max_compressed_size(tn) + 64;
+        uint8_t *bb = malloc(bcap);
+        if (bb) {
+            size_t cl = bcap - CPENC_HEADER_SIZE;
+            size_t tot = 0;
+            if (cpenc_compress_impl(tok, tn, bb + CPENC_HEADER_SIZE, &cl, mo, 1, 1) == 0) {
+                tot = CPENC_HEADER_SIZE + cl;
+                if (tot < base_len && tot <= cap) {
+                    CPEncHeader *bh = (CPEncHeader *)bb;
+                    bh->magic = CPENC_MAGIC; bh->version = CPENC_VERSION;
+                    bh->stride = CPENC_STRIDE_LZ;
+                    bh->original_size = (uint32_t)sl;
+                    bh->compressed_size = (uint32_t)cl;
+                    memcpy(d, bb, tot);
+                    res = tot;
+                }
+            }
+            free(bb);
+        }
+    }
+    free(tok);
+    return res;
 }
 
 /* Segmented Huffman: split the symbol stream into SEGS independent
@@ -830,7 +962,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                 size_t seg_len = sl - seg_off;
                 if (seg_len > CPENC_SEG_SIZE) seg_len = CPENC_SEG_SIZE;
                 size_t clen = (size_t)(*dl - (op - d));
-                if (cpenc_compress_impl(s + seg_off, seg_len, op, &clen, mo, 0, 0) != 0) {
+                if (cpenc_compress_impl(s + seg_off, seg_len, op, &clen, mo, 0, 1) != 0) {
                     free(hexbuf); return -1;
                 }
                 lenp[k * 4 + 0] = (uint8_t)(clen & 0xFF);
@@ -842,6 +974,15 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         }
         h->compressed_size = (uint32_t)(op - d - CPENC_HEADER_SIZE);
         *dl = (size_t)(op - d);
+        /* Match layer runs on the WHOLE block here, not per segment: a
+         * segment has no predecessor, so its first record is literals —
+         * for 1KB records that cold start (~1KB) is as large as the rest
+         * of the segment's compressed output, halving the ratio (57x -> 31x
+         * measured).  Matching across segment boundaries removes it. */
+        if (!no_lz && !hex_mode) {
+            size_t r = lz_try(s, sl, d, *dl, (size_t)(op - d), mo);
+            if (r) *dl = r;
+        }
         free(hexbuf);
         return 0;
     }
@@ -921,6 +1062,13 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         if (seg_e > 7.5) {
             size_t ext = hex_mode ? 2 : 1;
             if (*dl < CPENC_HEADER_SIZE + ext + sl) { free(lagbuf); free(hexbuf); return -1; }
+            /* Near-random *bytes* can still be a repeated record with a few
+             * fields changed (byte entropy ~8.0, structure highly
+             * redundant) — let the match layer bid before falling to RAW. */
+            if(!no_lz && !hex_mode){
+                size_t r = lz_try(s_bwt, sl, d, *dl, CPENC_HEADER_SIZE+ext+sl, mo);
+                if(r){ *dl=r; free(lagbuf);free(hexbuf); return 0; }
+            }
             h->magic=CPENC_MAGIC;h->version=CPENC_VERSION;
             h->stride= hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_RAW;
             h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(ext+sl);
@@ -994,6 +1142,13 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
     if(nraw==stride && stride>1 && sl>=256){
         size_t ext = hex_mode ? 2 : 1;
         if(*dl<CPENC_HEADER_SIZE+ext+sl){free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
+        /* The match layer gets first refusal: RAW is what delta/BWT produce
+         * on data that is really a repeated record with a few fields
+         * changed, and returning here would hide the match layer's win. */
+        if(!no_lz && !hex_mode){
+            size_t r = lz_try(s_bwt, sl, d, *dl, CPENC_HEADER_SIZE+ext+sl, mo);
+            if(r){ *dl=r; free(trial);free(trans);free(lagbuf);free(hexbuf); return 0; }
+        }
         h->magic=CPENC_MAGIC;h->version=CPENC_VERSION;h->stride= hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_RAW;
         h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(ext+sl);
         if(hex_mode) d[CPENC_HEADER_SIZE]=(uint8_t)stride;
@@ -1301,41 +1456,13 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * source code and access logs all beat it).
      * Format: [payload], payload = compressed token stream. */
     int lz_won = 0;
-    if (!no_lz && !hex_mode && sl >= 4096 && sl <= (1u<<20)) {
-        size_t main_len = (size_t)(out - d);
-        if (main_len * 4 > sl) {                 /* main path worse than 4x */
-            size_t tcap = sl + sl / 64 + 64;
-            uint8_t *tok = malloc(tcap);
-            if (tok) {
-                size_t tn = lz_encode(s_bwt, sl, tok, tcap);
-                if (tn && tn < sl) {
-                    size_t bcap = cpenc_max_compressed_size(tn) + 64;
-                    uint8_t *bb = malloc(bcap);
-                    if (bb) {
-                        size_t cl = bcap - CPENC_HEADER_SIZE;
-                        if (cpenc_compress_impl(tok, tn, bb + CPENC_HEADER_SIZE,
-                                                &cl, mo, 1, 1) == 0 &&
-                            CPENC_HEADER_SIZE + cl < main_len) {
-                            CPEncHeader *bh = (CPEncHeader *)bb;
-                            bh->magic = CPENC_MAGIC; bh->version = CPENC_VERSION;
-                            bh->stride = CPENC_STRIDE_LZ;
-                            bh->original_size = (uint32_t)sl;
-                            bh->compressed_size = (uint32_t)cl;
-                            memcpy(d, bb, CPENC_HEADER_SIZE + cl);
-                            /* Do NOT return: the BWT candidate below still
-                             * gets to compete against this result.  On
-                             * source code LZ lands between the main path
-                             * and BWT, and returning here hid BWT's win
-                             * (4.65x -> 3.30x). */
-                            out = d + CPENC_HEADER_SIZE + cl;
-                            lz_won = 1;
-                        }
-                        free(bb);
-                    }
-                }
-                free(tok);
-            }
-        }
+    if (!no_lz && !hex_mode) {
+        /* Do NOT return on a win: the BWT candidate below still gets to
+         * compete against this result.  On source code LZ lands between
+         * the main path and BWT, and returning here hid BWT's win
+         * (4.65x -> 3.30x). */
+        size_t r = lz_try(s_bwt, sl, d, *dl, (size_t)(out - d), mo);
+        if (r) { out = d + r; lz_won = 1; }
     }
 
     /* v6: BWT candidate — reorder so context-similar bytes are adjacent,
