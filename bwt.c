@@ -25,14 +25,16 @@ static void sais_impl(const int32_t *s, int32_t *sa, int n, int k) {
     for (int i = 0; i < n; i++)
         if (t[i] == 1 && (i == 0 || t[i-1] == 0)) lms[nlms++] = i;
     if (nlms == 0) {
-        /* no LMS => monotone input: non-decreasing suffixes sort by
-         * position (each is a prefix of the next or smaller); otherwise
-         * strictly decreasing sorts reversed.  O(n), no insertion sort —
-         * the O(n^2) fallback exploded on large recursion levels. */
-        int non_dec = 1;
+        /* no LMS => monotone input: strictly increasing suffixes sort by
+         * position; otherwise the order is reversed.  The test must be
+         * STRICT: with equal neighbours the shorter suffix is smaller
+         * (it is a prefix), so [2,2,2] sorts reversed, not by position —
+         * a non-decreasing test put runs of equal bytes in the wrong
+         * order and made bwt_dec output garbage. */
+        int strict_inc = 1;
         for (int i = 0; i + 1 < n; i++)
-            if (s[i] > s[i+1]) { non_dec = 0; break; }
-        if (non_dec) {
+            if (s[i] >= s[i+1]) { strict_inc = 0; break; }
+        if (strict_inc) {
             for (int i = 0; i < n; i++) sa[i+1] = (int32_t)i;
         } else {
             for (int i = 0; i < n; i++) sa[i+1] = n-1-i;
@@ -156,30 +158,44 @@ size_t bwt_enc(const uint8_t *s, size_t n, uint8_t *out) {
     if (n == 0) { out[0] = 0; return 0; }
     int32_t *sa = malloc((n + 1) * sizeof(int32_t));
     sais_sa(s, sa, n);
+    size_t eof_row = 0;
     for (int32_t i = 0; i <= (int32_t)n; i++) {
         int32_t p = sa[i];
         out[i] = (p == 0) ? 0 : s[p - 1];
+        if (p == 0) eof_row = (size_t)i;
     }
     free(sa);
-    return 0;   /* EOF row is always sa[0] */
+    return eof_row;
 }
 
-/* LF-mapping decode of the n+1-row linear BWT; output is n+1 bytes
- * with the EOF symbol at the last emitted position. */
-void bwt_dec(const uint8_t *b, size_t n1, size_t orig_idx, uint8_t *out) {
-    uint32_t *cnt = calloc(256, sizeof(uint32_t));
+/* LF-mapping decode of the n+1-row linear BWT; output is n+1 bytes with
+ * the EOF symbol first.
+ *
+ * The EOF row is written as byte 0, which is also a legal input byte, so
+ * the decoder cannot tell the sentinel apart from a real 0 in L.  It does
+ * not have to: `eof_row` (returned by bwt_enc) marks it, and removing that
+ * one occurrence from the character counts restores the true alphabet,
+ * where the sentinel is unique and strictly smallest.  For inputs with no
+ * 0x00 byte this yields exactly the same LF as the naive build. */
+void bwt_dec(const uint8_t *b, size_t n1, size_t eof_row, uint8_t *out) {
+    uint32_t cnt[256] = {0};
     for (size_t i = 0; i < n1; i++) cnt[b[i]]++;
+    if (eof_row < n1) cnt[b[eof_row]]--;      /* sentinel is not a character */
     uint32_t start[256];
     uint32_t sum = 0;
     for (int i = 0; i < 256; i++) { start[i] = sum; sum += cnt[i]; }
     uint32_t *lf = malloc(n1 * sizeof(uint32_t));
+    if (!lf) return;
     uint32_t cpos[256];
     memcpy(cpos, start, sizeof(cpos));
-    for (size_t i = 0; i < n1; i++) lf[i] = cpos[b[i]]++;
-    size_t pos = orig_idx;                    /* EOF row: sa[0] */
+    for (size_t i = 0; i < n1; i++) {
+        if (i == eof_row) { lf[i] = 0; continue; }   /* F[0] = sentinel */
+        lf[i] = 1 + cpos[b[i]]++;
+    }
+    size_t pos = 0;
     for (size_t i = n1; i-- > 0;) {
         out[i] = b[pos];
         pos = lf[pos];
     }
-    free(cnt); free(lf);
+    free(lf);
 }
