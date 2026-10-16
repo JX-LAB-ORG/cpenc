@@ -32,6 +32,12 @@ static void gc(uint8_t*b,size_t n){memset(b,0x42,n);for(size_t i=0;i<n;i+=8)b[i]
 static void gs(uint8_t*b,size_t n){for(size_t i=0;i<n;i++)b[i]=(i*7)&0xFF;}
 static void gr(uint8_t*b,size_t n){for(size_t i=0;i<n;i++)b[i]=rand()&0xFF;}
 static void gt(uint8_t*b,size_t n){const char*t="The quick brown fox jumps over the lazy dog. ";size_t tl=strlen(t);for(size_t i=0;i<n;i++)b[i]=(uint8_t)t[i%tl];}
+/* LZ match layer: exact repeats (identical lines, records with varying
+ * fields, random data with embedded duplicate blocks) must roundtrip. */
+static void glz1(uint8_t*b,size_t n){const char*l="2026-10-16 ERROR something failed with code 42\n";size_t L=strlen(l);for(size_t i=0;i<n;i++)b[i]=(uint8_t)l[i%L];}
+static void glz2(uint8_t*b,size_t n){size_t i=0;unsigned v=0;while(i<n){char t[96];int L=snprintf(t,sizeof(t),"rec %08u id=%08x status=ok\n",v,v*2654435761u);v++;for(int k=0;k<L&&i<n;k++)b[i++]=(uint8_t)t[k];}}
+static void glz3(uint8_t*b,size_t n){for(size_t i=0;i<n;i++)b[i]=(uint8_t)((i*2654435761u)>>24);
+    for(size_t k=0;k<8;k++){size_t blk=200+k*40,src=(k*997)%(n-blk),dst=(k*1777)%(n-blk);memmove(b+dst,b+src,blk);}}
 
 int main(void){
     uint8_t*b=malloc(32768);if(!b)return 1;
@@ -42,7 +48,8 @@ int main(void){
     struct{const char*nm;gf fn;int mo;}ts[]={
         {"INT4_4K",gi,2},{"LINEAR_4K",gl,2},{"CONST_4K",gc,1},
         {"SLOPE_4K",gs,2},{"TEXT_4K",gt,2},{"INT4_16K",gi,4},
-        {"LINEAR_16K",gl,4},{0,0,0}};
+        {"LINEAR_16K",gl,4},{"LZREP_16K",glz1,2},{"LZREC_16K",glz2,2},
+        {"LZMIX_16K",glz3,2},{0,0,0}};
     for(int i=0;ts[i].nm;i++){
         size_t sz=strstr(ts[i].nm,"16K")?16384:4096;
         ts[i].fn(b,sz); rt(ts[i].nm,b,sz,ts[i].mo);

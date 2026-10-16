@@ -18,6 +18,7 @@ extern "C" {
 #define CPENC_STRIDE_HEX 0xFE  /* hex-ascii text: 2:1 to binary + sep table */
 #define CPENC_STRIDE_SEG 0xFD  /* segmented: per-segment lag+stride */
 #define CPENC_STRIDE_BWT 0xFC  /* BWT: reorder then lag/stride (archive-mode) */
+#define CPENC_STRIDE_LZ  0xFB  /* match layer: exact repeats as (distance,len) */
 #define CPENC_LAG_NONE 0
 #define CPENC_SEG_SIZE  (64u << 10)   /* segment granularity */
 #define CPENC_SEG_MIN   (1u << 20)    /* block must be >= 1MB to segment */
