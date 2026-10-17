@@ -32,22 +32,22 @@ static void gc(uint8_t*b,size_t n){memset(b,0x42,n);for(size_t i=0;i<n;i+=8)b[i]
 static void gs(uint8_t*b,size_t n){for(size_t i=0;i<n;i++)b[i]=(i*7)&0xFF;}
 static void gr(uint8_t*b,size_t n){for(size_t i=0;i<n;i++)b[i]=rand()&0xFF;}
 static void gt(uint8_t*b,size_t n){const char*t="The quick brown fox jumps over the lazy dog. ";size_t tl=strlen(t);for(size_t i=0;i<n;i++)b[i]=(uint8_t)t[i%tl];}
-/* LZ match layer: exact repeats (identical lines, records with varying
+/* Reference layer: exact repeats (identical lines, records with varying
  * fields, random data with embedded duplicate blocks) must roundtrip. */
-static void glz1(uint8_t*b,size_t n){const char*l="2026-10-16 ERROR something failed with code 42\n";size_t L=strlen(l);for(size_t i=0;i<n;i++)b[i]=(uint8_t)l[i%L];}
-static void glz2(uint8_t*b,size_t n){size_t i=0;unsigned v=0;while(i<n){char t[96];int L=snprintf(t,sizeof(t),"rec %08u id=%08x status=ok\n",v,v*2654435761u);v++;for(int k=0;k<L&&i<n;k++)b[i++]=(uint8_t)t[k];}}
-static void glz3(uint8_t*b,size_t n){for(size_t i=0;i<n;i++)b[i]=(uint8_t)((i*2654435761u)>>24);
+static void gref1(uint8_t*b,size_t n){const char*l="2026-10-16 ERROR something failed with code 42\n";size_t L=strlen(l);for(size_t i=0;i<n;i++)b[i]=(uint8_t)l[i%L];}
+static void gref2(uint8_t*b,size_t n){size_t i=0;unsigned v=0;while(i<n){char t[96];int L=snprintf(t,sizeof(t),"rec %08u id=%08x status=ok\n",v,v*2654435761u);v++;for(int k=0;k<L&&i<n;k++)b[i++]=(uint8_t)t[k];}}
+static void gref3(uint8_t*b,size_t n){for(size_t i=0;i<n;i++)b[i]=(uint8_t)((i*2654435761u)>>24);
     for(size_t k=0;k<8;k++){size_t blk=200+k*40,src=(k*997)%(n-blk),dst=(k*1777)%(n-blk);memmove(b+dst,b+src,blk);}}
 /* Approximate match ("base + exceptions"): long records differing in a few
  * scattered bytes.  These look like noise to delta/BWT (byte entropy ~8)
  * and used to fall to RAW at 1.00x. */
-static void glz4(uint8_t*b,size_t n){size_t RL=1024; uint8_t*rec=malloc(RL); uint64_t s=12345;
+static void gref4(uint8_t*b,size_t n){size_t RL=1024; uint8_t*rec=malloc(RL); uint64_t s=12345;
     for(size_t i=0;i<RL;i++){s^=s<<13;s^=s>>7;s^=s<<17;rec[i]=(uint8_t)(s>>32);}
     for(size_t o=0;o+RL<=n;o+=RL){memcpy(b+o,rec,RL);
         for(int k=0;k<3;k++){s^=s<<13;s^=s>>7;s^=s<<17;size_t p=(s>>32)%RL;
             s^=s<<13;s^=s>>7;s^=s<<17;rec[p]=(uint8_t)(s>>32);}}
     free(rec);}
-static void glz5(uint8_t*b,size_t n){size_t RL=4096; uint8_t*rec=malloc(RL); uint64_t s=999;
+static void gref5(uint8_t*b,size_t n){size_t RL=4096; uint8_t*rec=malloc(RL); uint64_t s=999;
     for(size_t i=0;i<RL;i++){s^=s<<13;s^=s>>7;s^=s<<17;rec[i]=(uint8_t)(s>>32);}
     for(size_t o=0;o+RL<=n;o+=RL){memcpy(b+o,rec,RL);
         for(int k=0;k<8;k++){s^=s<<13;s^=s>>7;s^=s<<17;size_t p=(s>>32)%RL;
@@ -63,9 +63,9 @@ int main(void){
     struct{const char*nm;gf fn;int mo;}ts[]={
         {"INT4_4K",gi,2},{"LINEAR_4K",gl,2},{"CONST_4K",gc,1},
         {"SLOPE_4K",gs,2},{"TEXT_4K",gt,2},{"INT4_16K",gi,4},
-        {"LINEAR_16K",gl,4},{"LZREP_16K",glz1,2},{"LZREC_16K",glz2,2},
-        {"LZMIX_16K",glz3,2},{"LZREC1K_16K",glz4,2},
-        {"LZREC4K_16K",glz5,2},{0,0,0}};
+        {"LINEAR_16K",gl,4},{"REFREP_16K",gref1,2},{"REFREC_16K",gref2,2},
+        {"REFMIX_16K",gref3,2},{"REFREC1K_16K",gref4,2},
+        {"REFREC4K_16K",gref5,2},{0,0,0}};
     for(int i=0;ts[i].nm;i++){
         size_t sz=strstr(ts[i].nm,"16K")?16384:4096;
         ts[i].fn(b,sz); rt(ts[i].nm,b,sz,ts[i].mo);
