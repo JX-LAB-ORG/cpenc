@@ -1092,8 +1092,29 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * the sampled region and hurts the rest.  Split into 64KB segments,
      * each compressed independently as a sub-block (own lag/stride/tags);
      * segment lengths make the stream self-delimiting.  Segments smaller
-     * than the threshold recurse as plain single-block calls. */
-    if (sl >= CPENC_SEG_MIN && ent(s, 2048) >= 1.0) {
+     * than the threshold recurse as plain single-block calls.
+     *
+     * Below 1MB the split used to be skipped, which cost whole blocks: a
+     * 384KB byte-plane split of a K tensor (compressible high bytes, then
+     * random low bytes) has every group straddling both halves, so no tag
+     * can price it and the block fell to RAW at 1.00x where xz reaches
+     * 1.17x.  The spread test below segments those without paying the
+     * per-segment overhead on blocks that really are homogeneous. */
+    int want_seg = (sl >= CPENC_SEG_MIN);
+    if (!want_seg && sl >= (128u << 10)) {
+        size_t w = 1024, nw = 16;
+        double lo = 9.0, hi = 0.0;
+        if (sl / w >= nw) {
+            for (size_t i = 0; i < nw; i++) {
+                size_t off = (sl - w) * i / (nw - 1);
+                double e = ent(s + off, w);
+                if (e < lo) lo = e;
+                if (e > hi) hi = e;
+            }
+            want_seg = (hi - lo) > 1.0;
+        }
+    }
+    if (want_seg && ent(s, 2048) >= 1.0) {
         size_t n_seg = (sl + CPENC_SEG_SIZE - 1) / CPENC_SEG_SIZE;
         size_t ext = hex_mode ? 1 : 0;      /* real-stride byte for hex wrapper */
         size_t need = CPENC_HEADER_SIZE + ext + 4 + n_seg * 4;

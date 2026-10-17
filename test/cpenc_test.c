@@ -58,6 +58,10 @@ static void gbp(uint8_t*b,size_t n){uint64_t s=88172645463325252ULL;
         if((r>>8)%100<1)v=(uint8_t)(v&~0x40u);
         if((r>>16)%200<1)v=(uint8_t)(v|0x80u);
         b[i]=v;}}
+/* Mixed block: a compressible half then a random half.  In one block
+ * every group straddles both halves, so no tag can price it — this fell
+ * to RAW at 1.00x until the spread test started segmenting such blocks. */
+static void gmix(uint8_t*b,size_t n){size_t h=n/2;gt(b,h);gr(b+h,n-h);}
 static void gref5(uint8_t*b,size_t n){size_t RL=4096; uint8_t*rec=malloc(RL); uint64_t s=999;
     for(size_t i=0;i<RL;i++){s^=s<<13;s^=s>>7;s^=s<<17;rec[i]=(uint8_t)(s>>32);}
     for(size_t o=0;o+RL<=n;o+=RL){memcpy(b+o,rec,RL);
@@ -66,7 +70,7 @@ static void gref5(uint8_t*b,size_t n){size_t RL=4096; uint8_t*rec=malloc(RL); ui
     free(rec);}
 
 int main(void){
-    uint8_t*b=malloc(65536);if(!b)return 1;
+    uint8_t*b=malloc(262144);if(!b)return 1;
     srand(42);
 
     fprintf(stderr,"=== CPEnc v0.1 ===\n");
@@ -77,9 +81,9 @@ int main(void){
         {"LINEAR_16K",gl,4},{"REFREP_16K",gref1,2},{"REFREC_16K",gref2,2},
         {"REFMIX_16K",gref3,2},{"REFREC1K_16K",gref4,2},
         {"REFREC4K_16K",gref5,2},{"BITPLANE_16K",gbp,2},
-        {"BITPLANE_64K",gbp,2},{0,0,0}};
+        {"BITPLANE_64K",gbp,2},{"MIXED_256K",gmix,2},{0,0,0}};
     for(int i=0;ts[i].nm;i++){
-        size_t sz=strstr(ts[i].nm,"64K")?65536:strstr(ts[i].nm,"16K")?16384:4096;
+        size_t sz=strstr(ts[i].nm,"256K")?262144:strstr(ts[i].nm,"64K")?65536:strstr(ts[i].nm,"16K")?16384:4096;
         ts[i].fn(b,sz); rt(ts[i].nm,b,sz,ts[i].mo);
     }
 
