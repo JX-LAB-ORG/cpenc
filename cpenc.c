@@ -1236,6 +1236,10 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         if (per > seg_sz) seg_sz = per;
     }
     if (sl < 2 * seg_sz) seg_sz = (64u << 10);   /* too small to split coarsely */
+    if (!no_lz) {   /* tuning hook: top level only (nested calls pass no_lz) */
+        const char *cs = getenv("CPENC_CHUNK");
+        if (cs) { long v = atol(cs); if (v >= 4096) seg_sz = (size_t)v; }
+    }
     size_t n_seg = want_seg ? (sl + seg_sz - 1) / seg_sz : 0;
     /* n_seg < 2 would recurse into this same branch at the same size;
      * ent < 1.0 means a constant block, which the normal path encodes in
