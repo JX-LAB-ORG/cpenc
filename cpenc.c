@@ -328,7 +328,10 @@ static int sub5_decode(const uint8_t **pp, const uint8_t *edd, uint8_t *out,
 #define LZ_HBITS  16
 #define LZ_HSZ    (1u << LZ_HBITS)
 #define LZ_HMASK  (LZ_HSZ - 1)
-#define LZ_MAXTRY 64
+#define LZ_MAXTRY 16   /* real data is insensitive to depth (logs, records,
+                        * source all identical at 8..64); only the synthetic
+                        * word-soup loses ratio, 6.49x -> 5.79x, while
+                        * throughput gains 40%+ */
 static uint32_t lz_h4(const uint8_t *p) {
     uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
                  ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
@@ -357,6 +360,14 @@ static size_t lz_encode(const uint8_t *s, size_t n, uint8_t *t, size_t cap) {
                 size_t cd = i - (size_t)c;
                 if (cd && s[c] == s[i] && s[c+1] == s[i+1] &&
                     s[c+2] == s[i+2] && s[c+3] == s[i+3]) {
+                    /* Can this candidate even beat the current best?  One
+                     * compare at offset `best` rejects almost all of them;
+                     * without it every candidate walked the full match
+                     * length, which is most of the matcher's cost on
+                     * repetitive data. */
+                    if (best && s[c + best] != s[i + best]) {
+                        c = chain[c & LZ_HMASK]; tries++; continue;
+                    }
                     size_t L = 0;
                     while (i + L < n && s[c + L] == s[i + L]) L++;
                     if ((int)L > best) { best = (int)L; bestd = cd; }
