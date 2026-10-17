@@ -427,6 +427,72 @@ static int rle_build(const uint8_t *gp, size_t gs,
     *pnv = nv; *pnr8 = nr8;
     return 0;
 }
+/* Tag 6 (bit planes): split the group into its 8 bit planes.  Each plane
+ * is stored one of three ways, and the marker byte says which:
+ *   0 constant — one value byte;
+ *   1 packed   — pn bytes, bit i of byte i>>3 is plane bit i;
+ *   2 sparse   — 4-byte count, then (LEB gap, byte) per nonzero packed
+ *                byte; stores the plane's minority when it is the 1s;
+ *   3 sparse, inverted — like 2, the minority is the 0s; the decoder
+ *                inverts the plane after unpacking.
+ * Exact payload size, filling mk[8] so the emit can reuse the decision.
+ * Constant and near-constant planes are the win: quantisation scale
+ * factors (E8M0) have 7 planes that barely move, while a byte Huffman
+ * code must still pay for the bits that do. */
+static void plane_pack(const uint8_t *gp, size_t gs, int b, uint8_t *pk) {
+    size_t i = 0;
+    for (; i + 8 <= gs; i += 8) {
+        pk[i >> 3] = (uint8_t)(((gp[i  ] >> b) & 1)       | ((gp[i+1] >> b) & 1) << 1 |
+                               ((gp[i+2] >> b) & 1) << 2  | ((gp[i+3] >> b) & 1) << 3 |
+                               ((gp[i+4] >> b) & 1) << 4  | ((gp[i+5] >> b) & 1) << 5 |
+                               ((gp[i+6] >> b) & 1) << 6  | ((gp[i+7] >> b) & 1) << 7);
+    }
+    if (i < gs) {
+        uint8_t v = 0;
+        for (int j = 0; i + (size_t)j < gs; j++)
+            v |= (uint8_t)(((gp[i + (size_t)j] >> b) & 1) << j);
+        pk[i >> 3] = v;
+    }
+}
+static size_t bitplane_plan(const uint8_t *gp, size_t gs, const size_t bcnt[8],
+                            uint8_t mk[8]) {
+    size_t pn = (gs + 7) / 8;
+    uint8_t *pk = malloc(pn ? pn : 1);
+    if (!pk) return (size_t)-1;
+    size_t sz = 8;                        /* marker bytes */
+    for (int b = 0; b < 8; b++) {
+        size_t o = bcnt[b];
+        if (o == 0 || o == gs) { mk[b] = 0; sz += 1; continue; }
+        /* A set byte costs at least 2 bytes and holds at most 8 minority
+         * bits, so a plane with a dense minority cannot go sparse — decide
+         * that from the counts and skip packing it (random data lands here
+         * for all 8 planes). */
+        {
+            size_t mn0 = o < gs - o ? o : gs - o;
+            if (4 + 2 * ((mn0 + 7) / 8) >= pn) { mk[b] = 1; sz += pn; continue; }
+        }
+        plane_pack(gp, gs, b, pk);
+        int inv = (o > gs - o);           /* minority are zeros */
+        if (inv) for (size_t i = 0; i < pn; i++) pk[i] ^= 0xFF;
+        size_t nz = 0;
+        for (size_t i = 0; i < pn; i++) nz += (pk[i] != 0);
+        size_t sp = pn;
+        /* every set byte costs at least 2 bytes, so below this the gaps
+         * cannot possibly beat the packed form — skip the walk when they
+         * cannot (packed planes are the common case) */
+        if (4 + 2 * nz < pn) {
+            sp = 4; uint32_t prev = 0;
+            for (size_t i = 0; i < pn; i++) if (pk[i]) {
+                sp += (size_t)leb_len((uint32_t)i - prev) + 1;
+                prev = (uint32_t)i;
+            }
+        }
+        if (sp < pn) { mk[b] = (uint8_t)(inv ? 3 : 2); sz += sp; }
+        else { mk[b] = 1; sz += pn; }
+    }
+    free(pk);
+    return sz;
+}
 /* Returns token-stream length, or 0 if the block is not worth matching. */
 static size_t ref_encode(const uint8_t *s, size_t n, uint8_t *t, size_t cap) {
     if (n < 256) return 0;
@@ -1297,6 +1363,8 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         int nz=0;for(int i=0;i<256;i++)if(fq[i])nz++;
 
         size_t sz_raw=4+gs; uint8_t tag;
+        uint8_t mk_bp[8] = {0};   /* tag 6 plane plan, reused by the emit */
+        size_t bcnt_bp[8] = {0};  /* tag 6 per-plane set-bit counts */
         /* Every candidate's bid is its exact emitted byte count, so the
          * tag competition is a true minimum.  Entropy estimates with a
          * safety margin used to forfeit gains under 3% (at 8MB that margin
@@ -1311,6 +1379,34 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             size_t sz_best=sz_raw; tag=3;
             if(sz_l<sz_best){tag=1;sz_best=sz_l;}
             if(sz_h<sz_best){tag=2;sz_best=sz_h;}
+            /* tag 6: bit planes.  Packed planes alone can never beat a byte
+             * Huffman code (H(byte) <= sum of plane entropies), so the tag
+             * only pays where a plane is constant or near-constant.  Plan
+             * only when a cheap lower bound can still beat the best bid:
+             * per plane, the minority needs at least ceil(mn/8) packed
+             * bytes at 2 bytes each, or pn if that is less.  Without this
+             * the pack ran on every text group (ASCII has a constant top
+             * plane) and halved throughput. */
+            {
+                size_t pn_bp = (gs + 7) / 8;
+                size_t lb = 8;
+                for (int b = 0; b < 8; b++) {
+                    size_t o = 0;
+                    for (int i2 = 0; i2 < 256; i2++)
+                        if (fq[i2] && ((i2 >> b) & 1)) o += fq[i2];
+                    bcnt_bp[b] = o;
+                    if (o == 0 || o == gs) { lb += 1; continue; }
+                    size_t mn = o < gs - o ? o : gs - o;
+                    size_t sp_lb = 4 + 2 * ((mn + 7) / 8);
+                    lb += sp_lb < pn_bp ? sp_lb : pn_bp;
+                }
+                if (lb < sz_best) {
+                    size_t sz_bp = bitplane_plan(gp, gs, bcnt_bp, mk_bp);
+                    if (sz_bp != (size_t)-1 && sz_bp < sz_best) {
+                        tag = 6; sz_best = sz_bp;
+                    }
+                }
+            }
             /* tag 5: single-value dominance — one symbol covers >99% of the
              * group.  Encode the constant plus a short exception list
              * (positions LEB128 + values), vs Huffman's wasteful 1-bit-per-
@@ -1506,6 +1602,40 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             }
             if(used==0||(size_t)(edd-out)<used){free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
             out+=used;
+        }else if(tag==6){
+            /* bit planes — markers were planned during selection */
+            size_t pn_bp = (gs + 7) / 8;
+            if ((size_t)(edd - out) < 16) { free(trial);free(trans);free(lagbuf);free(hexbuf); return -1; }
+            uint8_t *mk = out; out += 8;
+            memcpy(mk, mk_bp, 8);
+            uint8_t *pk = malloc(pn_bp ? pn_bp : 1);
+            if (!pk) { free(trial);free(trans);free(lagbuf);free(hexbuf); return -1; }
+            for (int b = 0; b < 8; b++) {
+                if (mk[b] == 0) { *out++ = (uint8_t)(bcnt_bp[b] ? 1 : 0); continue; }
+                plane_pack(gp, gs, b, pk);
+                if (mk[b] == 3)
+                    for (size_t i2 = 0; i2 < pn_bp; i2++) pk[i2] ^= 0xFF;
+                if (mk[b] >= 2) {
+                    size_t nz = 0;
+                    for (size_t i2 = 0; i2 < pn_bp; i2++) if (pk[i2]) nz++;
+                    if ((size_t)(edd - out) < 4 + nz*6) {
+                        free(pk);free(trial);free(trans);free(lagbuf);free(hexbuf); return -1;
+                    }
+                    *out++ = (uint8_t)(nz & 0xFF); *out++ = (uint8_t)((nz >> 8) & 0xFF);
+                    *out++ = (uint8_t)((nz >> 16) & 0xFF); *out++ = (uint8_t)((nz >> 24) & 0xFF);
+                    uint32_t prev = 0;
+                    for (size_t i2 = 0; i2 < pn_bp; i2++) if (pk[i2]) {
+                        out += leb_put(out, (uint32_t)i2 - prev);
+                        *out++ = pk[i2]; prev = (uint32_t)i2;
+                    }
+                } else {
+                    if ((size_t)(edd - out) < pn_bp) {
+                        free(pk);free(trial);free(trans);free(lagbuf);free(hexbuf); return -1;
+                    }
+                    memcpy(out, pk, pn_bp); out += pn_bp;
+                }
+            }
+            free(pk);
         }else{
             if((size_t)(edd-out)<4+gs){free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
             *out++=gs&0xFF;*out++=(gs>>8)&0xFF;*out++=(gs>>16)&0xFF;*out++=gs>>24;
@@ -1903,6 +2033,46 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     while(rbc<nbits&&p<edd){rbuf|=(uint64_t)(*p++)<<rbc;rbc+=8;}
                     uint8_t idx=rbuf&((1<<nbits)-1);rbuf>>=nbits;rbc-=nbits;
                     gp[i]=idx<nz?lut[idx]:lut[0];
+                }
+            }
+        }else if(tag==6){
+            /* bit planes: [8 markers][per plane: 1 value byte | pn packed
+             * bytes | 4-byte count + (gap LEB, byte)*] */
+            if((size_t)(edd-p)<8){if(stride>1)free(trans);return-1;}
+            const uint8_t *mk=p; p+=8;
+            size_t pn_bp=(gs+7)/8;
+            memset(gp,0,gs);
+            for(int b=0;b<8;b++){
+                if(mk[b]==0){
+                    if(p>=edd){if(stride>1)free(trans);return-1;}
+                    if(*p++) for(size_t i2=0;i2<gs;i2++) gp[i2]|=(uint8_t)(1u<<b);
+                }else if(mk[b]==1){
+                    if((size_t)(edd-p)<pn_bp){if(stride>1)free(trans);return-1;}
+                    for(size_t i2=0;i2<gs;i2++)
+                        if((p[i2>>3]>>(i2&7))&1) gp[i2]|=(uint8_t)(1u<<b);
+                    p+=pn_bp;
+                }else{
+                    if((size_t)(edd-p)<4){if(stride>1)free(trans);return-1;}
+                    uint32_t nz=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
+                    uint32_t prev=0;
+                    for(uint32_t k=0;k<nz;k++){
+                        uint32_t g2=0,sh2=0;
+                        for(;;){
+                            if(p>=edd||sh2>=32){if(stride>1)free(trans);return-1;}
+                            uint8_t bb=*p++;
+                            g2|=(uint32_t)(bb&0x7F)<<sh2;
+                            if(!(bb&0x80))break;
+                            sh2+=7;
+                        }
+                        prev+=g2;
+                        if(prev>=pn_bp||p>=edd){if(stride>1)free(trans);return-1;}
+                        uint8_t v=*p++;
+                        for(int j2=0;j2<8;j2++) if((v>>j2)&1){
+                            size_t idx=(size_t)prev*8+j2;
+                            if(idx<gs) gp[idx]|=(uint8_t)(1u<<b);
+                        }
+                    }
+                    if(mk[b]==3) for(size_t i2=0;i2<gs;i2++) gp[i2]^=(uint8_t)(1u<<b);
                 }
             }
         }else if(tag==5){

@@ -47,6 +47,17 @@ static void gref4(uint8_t*b,size_t n){size_t RL=1024; uint8_t*rec=malloc(RL); ui
         for(int k=0;k<3;k++){s^=s<<13;s^=s>>7;s^=s<<17;size_t p=(s>>32)%RL;
             s^=s<<13;s^=s>>7;s^=s<<17;rec[p]=(uint8_t)(s>>32);}}
     free(rec);}
+/* Bit planes (tag 6): values sharing 7 bits, with rare deviations in
+ * different directions — one plane constant, one dense (packed), and
+ * sparse ones in both polarities. */
+static void gbp(uint8_t*b,size_t n){uint64_t s=88172645463325252ULL;
+    for(size_t i=0;i<n;i++){s^=s<<13;s^=s>>7;s^=s<<17;uint32_t r=(uint32_t)(s>>32);
+        uint8_t v=0x7F;
+        if(r&1)v=(uint8_t)(v&~1u);
+        if(r%100<1)v=(uint8_t)(v&~2u);
+        if((r>>8)%100<1)v=(uint8_t)(v&~0x40u);
+        if((r>>16)%200<1)v=(uint8_t)(v|0x80u);
+        b[i]=v;}}
 static void gref5(uint8_t*b,size_t n){size_t RL=4096; uint8_t*rec=malloc(RL); uint64_t s=999;
     for(size_t i=0;i<RL;i++){s^=s<<13;s^=s>>7;s^=s<<17;rec[i]=(uint8_t)(s>>32);}
     for(size_t o=0;o+RL<=n;o+=RL){memcpy(b+o,rec,RL);
@@ -55,7 +66,7 @@ static void gref5(uint8_t*b,size_t n){size_t RL=4096; uint8_t*rec=malloc(RL); ui
     free(rec);}
 
 int main(void){
-    uint8_t*b=malloc(32768);if(!b)return 1;
+    uint8_t*b=malloc(65536);if(!b)return 1;
     srand(42);
 
     fprintf(stderr,"=== CPEnc v0.1 ===\n");
@@ -65,9 +76,10 @@ int main(void){
         {"SLOPE_4K",gs,2},{"TEXT_4K",gt,2},{"INT4_16K",gi,4},
         {"LINEAR_16K",gl,4},{"REFREP_16K",gref1,2},{"REFREC_16K",gref2,2},
         {"REFMIX_16K",gref3,2},{"REFREC1K_16K",gref4,2},
-        {"REFREC4K_16K",gref5,2},{0,0,0}};
+        {"REFREC4K_16K",gref5,2},{"BITPLANE_16K",gbp,2},
+        {"BITPLANE_64K",gbp,2},{0,0,0}};
     for(int i=0;ts[i].nm;i++){
-        size_t sz=strstr(ts[i].nm,"16K")?16384:4096;
+        size_t sz=strstr(ts[i].nm,"64K")?65536:strstr(ts[i].nm,"16K")?16384:4096;
         ts[i].fn(b,sz); rt(ts[i].nm,b,sz,ts[i].mo);
     }
 
