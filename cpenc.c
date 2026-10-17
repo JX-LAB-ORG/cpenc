@@ -212,12 +212,12 @@ static uint32_t h_enc(const uint8_t *d,size_t n,const uint8_t lens[256],const ui
 }
 
 static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n);
+static _Thread_local int t_in_worker = 0;
 /* ── segment-level parallelism ─────────────────────────────────
  * v5 segments are independent: compress/decompress them across
  * threads.  Opt-in: default auto (only for enough segments),
  * CPENC_THREADS=N forces N, CPENC_NO_THREADS=1 forces 1 (PRoot's
  * scheduler can wedge under load — the env fallback stays). */
-static _Thread_local int t_in_worker = 0;
 static int seg_threads(size_t n_seg) {
     /* default single-threaded: PRoot's scheduler penalizes threads,
      * and small blocks lose to thread setup.  CPENC_THREADS=N opts in
@@ -280,7 +280,10 @@ typedef struct { const uint8_t *src; size_t clen; uint8_t *out; size_t cap; size
 static void *seg_dec_worker(void *arg) {
     SegDecJob *j = arg;
     size_t dl = j->cap;
+    t_in_worker++;                    /* a nested segmented block must not
+                                       * spawn its own pool inside a worker */
     j->rc = cpenc_decompress(j->src, j->clen, j->out, &dl);
+    t_in_worker--;
     j->outlen = dl;
     return NULL;
 }
