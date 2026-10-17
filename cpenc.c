@@ -676,17 +676,23 @@ static uint64_t ref_h16(const uint8_t *p) {
     b ^= b >> 29; b *= 0xc4ceb9fe1a85ec53ULL;
     return (a ^ b) >> 16;
 }
-/* Fraction of 16-byte windows that repeat elsewhere in the block, sampled
- * across the whole block (not just its head).  See the probe in ref_try. */
+/* Fraction of 16-byte windows that repeat elsewhere in the block.  The
+ * sample must be chosen by CONTENT, not by position: sampling every k-th
+ * byte only sees duplicates whose distance happens to be a multiple of k,
+ * so a 29KB prefix repeated at a 32.6KB distance (shared-prefix KV) scored
+ * 0.00% against a true duplication of 68% and the whole block lost the
+ * match layer.  Keeping one position in 16 by a hash of the bytes there
+ * keeps both copies of a repeated region together whatever the distance. */
 static double ref_dup_frac(const uint8_t *s, size_t n) {
     if (n < 8192 || n > 0x7FFFFFF0u) return 0.0;
-    size_t step = n / 65536;
-    if (step < 16) step = 16;
     int32_t *tab = malloc(65536 * sizeof(int32_t));
     if (!tab) return 1.0;                     /* short on memory: be permissive */
     for (int i = 0; i < 65536; i++) tab[i] = -1;
     size_t hits = 0, tot = 0;
-    for (size_t i = 0; i + 16 <= n; i += step) {
+    for (size_t i = 0; i + 16 <= n; i += 4) {           /* 4-byte grid: repeats
+        * of binary data land on it, and the scan costs a quarter as much */
+        uint32_t v; memcpy(&v, s + i, 4);
+        if (((v * 2654435761u) >> 28) != 0) continue;   /* 1 in 16, by content */
         uint32_t h = (uint32_t)(ref_h16(s + i) & 0xFFFF);
         int32_t p = tab[h];
         if (p >= 0 && memcmp(s + (size_t)p, s + i, 16) == 0) hits++;
