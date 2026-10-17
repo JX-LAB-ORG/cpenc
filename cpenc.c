@@ -1226,15 +1226,25 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
     }
     /* Segment size.  SEG_SIZE is the content-isolation granularity (big
      * enough that the per-segment table costs fade, small enough to keep
-     * mixed regions apart).  When threads are requested the block is cut
-     * into one big chunk per core instead — a 64KB piece per thread is
-     * too fine to be worth a task. */
+     * mixed regions apart), and it must be a pure function of the DATA:
+     * an earlier version widened it to sl/nthr ("one big chunk per
+     * core"), which made the encoder's output depend on CPENC_THREADS.
+     * The nested calls a top-level block makes — the match layer
+     * recompressing its token stream (ref_try), and every segment a
+     * worker compresses — run this same code, and ref_try runs on the
+     * main thread where the t_in_worker guard is clear, so a thread
+     * count of 4 cut an 8MB records block into 2MB chunks at the top and
+     * 1MB chunks inside the match layer instead of the 512KB both used
+     * at t=1.  4 x 1MB chunks is exactly the pathological split for that
+     * token stream: 1MB < 2*SEG_SIZE forces the 64KB fallback, whose
+     * chunks then trip the constant-block test (ent < 1.0) and switch
+     * segmentation off entirely, and 1373045 bytes became 1540207
+     * (6.1095x -> 5.4464x).  The pool splits by the shared counter now,
+     * so the per-core chunking buys nothing: 512KB tasks feed 4 workers
+     * just as well, and the top level is bit-identical at any thread
+     * count. */
     size_t seg_sz = CPENC_SEG_SIZE;
     int nthr = seg_threads(16);
-    if (nthr > 1) {
-        size_t per = (sl + (size_t)nthr - 1) / (size_t)nthr;
-        if (per > seg_sz) seg_sz = per;
-    }
     if (sl < 2 * seg_sz) seg_sz = (64u << 10);   /* too small to split coarsely */
     if (!no_lz) {   /* tuning hook: top level only (nested calls pass no_lz) */
         const char *cs = getenv("CPENC_CHUNK");
