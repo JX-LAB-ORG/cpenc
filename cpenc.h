@@ -20,6 +20,9 @@ extern "C" {
 #define CPENC_STRIDE_SEG 0xFD  /* segmented: per-segment lag+stride */
 #define CPENC_STRIDE_BWT 0xFC  /* BWT: reorder then lag/stride (archive-mode) */
 #define CPENC_STRIDE_REF 0xFB  /* reference layer: repeats as (distance,len) + patches */
+/* Reference layer: run it when this fraction of spread 16-byte windows
+ * repeat, even if the head sample looked unmatchable. */
+#define REF_DUP_MIN 0.02
 #define CPENC_LAG_NONE 0
 #define CPENC_SEG_SIZE  (64u << 10)   /* segment granularity */
 #define CPENC_SEG_MIN   (1u << 20)    /* block must be >= 1MB to segment */

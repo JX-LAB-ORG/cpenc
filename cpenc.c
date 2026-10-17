@@ -669,6 +669,33 @@ static int ref_decode(const uint8_t *t, size_t tn, uint8_t *out, size_t outn) {
 int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl,
                         int mo, int no_bwt, int no_lz);
 
+static uint64_t ref_h16(const uint8_t *p) {
+    uint64_t a, b;
+    memcpy(&a, p, 8); memcpy(&b, p + 8, 8);
+    a ^= a >> 33; a *= 0xff51afd7ed558ccdULL;
+    b ^= b >> 29; b *= 0xc4ceb9fe1a85ec53ULL;
+    return (a ^ b) >> 16;
+}
+/* Fraction of 16-byte windows that repeat elsewhere in the block, sampled
+ * across the whole block (not just its head).  See the probe in ref_try. */
+static double ref_dup_frac(const uint8_t *s, size_t n) {
+    if (n < 8192 || n > 0x7FFFFFF0u) return 0.0;
+    size_t step = n / 65536;
+    if (step < 16) step = 16;
+    int32_t *tab = malloc(65536 * sizeof(int32_t));
+    if (!tab) return 1.0;                     /* short on memory: be permissive */
+    for (int i = 0; i < 65536; i++) tab[i] = -1;
+    size_t hits = 0, tot = 0;
+    for (size_t i = 0; i + 16 <= n; i += step) {
+        uint32_t h = (uint32_t)(ref_h16(s + i) & 0xFFFF);
+        int32_t p = tab[h];
+        if (p >= 0 && memcmp(s + (size_t)p, s + i, 16) == 0) hits++;
+        else tab[h] = (int32_t)i;
+        tot++;
+    }
+    free(tab);
+    return tot ? (double)hits / (double)tot : 0.0;
+}
 /* Try the match layer against base_len (the best size so far).  On a win
  * it writes the whole block into d and returns its length, else 0.
  * Called from two places: the RAW passthrough needs it too, because
@@ -694,8 +721,14 @@ static size_t ref_try(const uint8_t *s, size_t sl, uint8_t *d, size_t cap,
         size_t pn = sl < 32768 ? sl : 32768;
         if (pn < 4096) { free(tok); return 0; }
         size_t pt = ref_encode(s, pn, tok, tcap);
-        if (!pt || pt * 13 > pn * 10) { free(tok); return 0; }   /* under 1.3x on the
-            * sample: the full pass cannot pay for itself */
+        if (!pt || pt * 13 > pn * 10) {          /* under 1.3x on the sample */
+            /* The head sample cannot see repeats living further into the
+             * block.  Layer-0 KV is a per-token lookup table whose rows
+             * repeat 2.3x, but its first 85 rows happen to be distinct, so
+             * the layer was skipped and the block stored at 1.16x where
+             * matching reaches 1.88x.  A cheap spread sample decides. */
+            if (ref_dup_frac(s, sl) < REF_DUP_MIN) { free(tok); return 0; }
+        }
     }
     size_t tn = ref_encode(s, sl, tok, tcap);
     size_t res = 0;
