@@ -432,7 +432,12 @@ static int rle_build(const uint8_t *gp, size_t gs,
                      uint32_t **pruns, uint8_t **pvls, size_t *pnv,
                      uint8_t **pr8, size_t *pnr8, size_t *psz,
                      int *pst_r, int *pst_v) {
-    uint32_t *runs = malloc((gs/2+2)*sizeof(uint32_t));
+    /* Sized for the worst case, not for what the caller's zero-density
+     * gate happens to guarantee: the run count is bounded by the number
+     * of non-zero bytes plus one, and relying on that gate made the
+     * buffer overflow the moment anyone loosened it (found by an audit
+     * that relaxed fq[0] > gs/2 to gs/8 and crashed here on records). */
+    uint32_t *runs = malloc((gs+2)*sizeof(uint32_t));
     uint8_t *vls = malloc(gs);
     if (!runs || !vls) { free(runs); free(vls); return -1; }
     size_t nr = 0, nv = 0, i;
