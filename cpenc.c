@@ -521,7 +521,7 @@ static size_t ref_encode(const uint8_t *s, size_t n, uint8_t *t, size_t cap) {
                      * without it every candidate walked the full match
                      * length, which is most of the matcher's cost on
                      * repetitive data. */
-                    if (best && s[c + best] != s[i + best]) {
+                    if (best && i + best < n && s[c + best] != s[i + best]) {
                         c = chain[c & REF_HMASK]; tries++; continue;
                     }
                     size_t L = 0;
