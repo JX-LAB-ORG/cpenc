@@ -734,25 +734,125 @@ static uint64_t ref_h16(const uint8_t *p) {
  * so a 29KB prefix repeated at a 32.6KB distance (shared-prefix KV) scored
  * 0.00% against a true duplication of 68% and the whole block lost the
  * match layer.  Keeping one position in 16 by a hash of the bytes there
- * keeps both copies of a repeated region together whatever the distance. */
-static double ref_dup_frac(const uint8_t *s, size_t n) {
-    if (n < 4096 || n > 0x7FFFFFF0u) return 0.0;
+ * keeps both copies of a repeated region together whatever the distance.
+ *
+ * The same walk also reports `bestpos`/`bestlen`: the earlier occurrence of
+ * the longest match it saw (extension capped at REF_LONG) and its length.
+ * Both are used by the profitability probe below.  Sampling at `bestpos`
+ * rather than at the head matters for a mixed block (varied source in front
+ * of a periodic table): its head is unmatchable, a 256KB head sample scored
+ * the reference layer at 17.8x the main path, the layer was skipped and the
+ * block lost 114x -> 62x.  A sample drawn from the most repetitive region
+ * sees what the matcher will see.  `bestlen` covers the case no sample can:
+ * a repeat megabytes away (4 concatenated copies of a 1MB record block
+ * score bestlen 65536 but any 256KB window sees only its own copy and
+ * looks like ordinary records).
+ *
+ * The extension is bounded twice: it stops at REF_LONG (past that the
+ * "long match" test is already decided) and is only run once per
+ * REF_EXT_STRIDE bytes of block, so the walks spread over the whole block
+ * instead of piling up on the first hits.  Walking every hit cost libstdc++
+ * 2x — it has 36% duplicate windows whose matches run tens of KB, and every
+ * one was walked; a fixed count instead missed the long matches entirely on
+ * a 4MB concatenated-record block, whose first 128 hits are all short
+ * template matches and whose cross-copy matches only start 1MB in. */
+#define REF_LONG      (1024u)   /* a match this long is "large-scale structure" */
+#define REF_EXT_STRIDE (4096u)  /* walk at most one hit per this many bytes */
+static double ref_dup_frac_best(const uint8_t *s, size_t n, size_t *bestpos,
+                                size_t *bestlenp) {
+    if (n < 4096 || n > 0x7FFFFFF0u) { *bestpos = 0; *bestlenp = 0; return 0.0; }
     int32_t *tab = malloc(65536 * sizeof(int32_t));
-    if (!tab) return 1.0;                     /* short on memory: be permissive */
+    if (!tab) { *bestpos = 0; *bestlenp = 0; return 1.0; }  /* OOM: permissive */
     for (int i = 0; i < 65536; i++) tab[i] = -1;
-    size_t hits = 0, tot = 0;
+    size_t hits = 0, tot = 0, bestlen = 0, last_ext = (size_t)-1;
+    *bestpos = 0;
     for (size_t i = 0; i + 16 <= n; i += 4) {           /* 4-byte grid: repeats
         * of binary data land on it, and the scan costs a quarter as much */
         uint32_t v; memcpy(&v, s + i, 4);
         if (((v * 2654435761u) >> 28) != 0) continue;   /* 1 in 16, by content */
         uint32_t h = (uint32_t)(ref_h16(s + i) & 0xFFFF);
         int32_t p = tab[h];
-        if (p >= 0 && memcmp(s + (size_t)p, s + i, 16) == 0) hits++;
-        else tab[h] = (int32_t)i;
+        if (p >= 0 && memcmp(s + (size_t)p, s + i, 16) == 0) {
+            hits++;
+            if (bestlen < REF_LONG && (last_ext == (size_t)-1 ||
+                                       i - last_ext >= REF_EXT_STRIDE)) {
+                last_ext = i;
+                size_t L = 16;
+                while (L < REF_LONG && i + L < n && s[(size_t)p + L] == s[i + L]) L++;
+                if (L > bestlen) { bestlen = L; *bestpos = (size_t)p; }
+            }
+        } else tab[h] = (int32_t)i;
         tot++;
     }
     free(tab);
+    *bestlenp = bestlen;
     return tot ? (double)hits / (double)tot : 0.0;
+}
+/* Compressed size of the reference path over the first S bytes of s: the
+ * matcher followed by the normal machinery on its token stream.  0 if the
+ * sample cannot be matched at all (token stream no smaller than the input). */
+static size_t ref_sample_size(const uint8_t *s, size_t S, int mo) {
+    size_t tcap = S + S / 64 + 64;
+    uint8_t *tok = malloc(tcap);
+    if (!tok) return 0;
+    size_t tn = ref_encode(s, S, tok, tcap);
+    size_t tot = 0;
+    if (tn && tn < S) {
+        size_t bcap = cpenc_max_compressed_size(tn) + 64;
+        uint8_t *bb = malloc(bcap);
+        if (bb) {
+            size_t cl = bcap - CPENC_HEADER_SIZE;
+            if (cpenc_compress_impl(tok, tn, bb + CPENC_HEADER_SIZE, &cl, mo, 1, 1) == 0)
+                tot = CPENC_HEADER_SIZE + cl;
+            free(bb);
+        }
+    }
+    free(tok);
+    return tot;
+}
+/* Will the reference layer beat base_len?  The duplication gate above only
+ * proves repeats EXIST; on a log whose fields are random the template
+ * repeats but matching still loses to the main path, and the full pass was
+ * pure waste (4MB random-field log: 13.3 -> 10.1 MB/s, ratio unchanged).
+ * So run the real pipeline on two nested samples and fit size(S) = a + b*S,
+ * which separates the fixed cost (the first occurrence is always literals)
+ * from the marginal one.  Extrapolating the raw ratio instead made a
+ * periodic table look unprofitable — its whole ref stream is one 4KB
+ * period, so size(S)/S shrinks as S grows and a single sample overstates
+ * it (ratio 1.01 vs 0.03 for the fit).
+ *
+ * The threshold is loose on purpose: this gate is a speed guard, and the
+ * cost of being wrong is asymmetric.  A false "skip" loses a real ratio
+ * (the reference layer reaches 3013x on the periodic table); a false "run"
+ * costs one pass.  Measured ratios (projected/base): periodic 0.03, text
+ * 0.00, log template 0.06, mixed 0.02, records 1.10, random-field log 1.91
+ * — so 1.4 sits in an empty band, not against a cluster.
+ *
+ * A long match short-circuits the probe: it is large-scale structure no
+ * sample of this size can see (it may be megabytes away), and every corpus
+ * with one profited hugely — the periodic table, the single-line log, the
+ * concatenated record block.  The short-match corpora are exactly the ones
+ * the probe is for. */
+#define REF_PROBE  (128u << 10)                /* samples: 128KB and 256KB */
+static int ref_profitable(const uint8_t *s, size_t sl, size_t base_len,
+                          int mo, size_t bestpos, size_t bestlen) {
+    size_t S1 = REF_PROBE, S2 = REF_PROBE * 2;
+    if (bestlen >= REF_LONG) return 1;
+    if (S2 >= sl) return 1;                    /* small block: the pass is cheap */
+    size_t start = bestpos;
+    if (start + S2 > sl) start = sl - S2;
+    size_t t1 = ref_sample_size(s + start, S1, mo);
+    /* The sample could not be matched at all: its repetition lives further
+     * away than 128KB reaches (a table whose period is 2MB), so the sample
+     * is unrepresentative — defer to the duplication gate. */
+    if (!t1) return 1;
+    size_t t2 = ref_sample_size(s + start, S2, mo);
+    if (!t2) return 1;
+    double b = (t2 > t1) ? (double)(t2 - t1) / (double)(S2 - S1) : 0.0;
+    double a = (double)t1 - b * (double)S1;
+    if (a < 0.0) a = 0.0;
+    double proj = a + b * (double)sl;
+    return proj < (double)base_len * 1.4;
 }
 /* Try the match layer against base_len (the best size so far).  On a win
  * it writes the whole block into d and returns its length, else 0.
@@ -772,25 +872,27 @@ static size_t ref_try(const uint8_t *s, size_t sl, uint8_t *d, size_t cap,
     size_t tcap = sl + sl / 64 + 64;
     uint8_t *tok = malloc(tcap);
     if (!tok) return 0;
-    /* Probe the first 32KB before matching the whole block: data with no
-     * repeats (random bytes, float noise) would otherwise pay a full pass
-     * for nothing — measured 95 -> 2.9 MB/s on random at block size 8MB.
-     * Fixed 32KB, not a fraction: shrinking it to sl/16 made a 220KB
-     * heterogeneous block look unmatchable (its first 13KB really are
-     * nearly unique) and dropped that block from 2.53x to 1.59x.  The
-     * 32KB is 0.4% of an 8MB block and 15% of a 220KB one — the latter
-     * costs absolute milliseconds, which is the right trade. */
     {
-        /* One gate, measured over the whole block.  It used to encode the
-         * first 32KB as well, but that sample cannot see repeats living
-         * further in — layer-0 KV is a per-token lookup table whose rows
-         * repeat 2.3x and whose first 85 rows are distinct — and it cost
-         * 16% of compression time on FP4 weights, where the spread test
-         * says no before a byte is matched.  Matches shorter than the
-         * 16-byte window are worth ~3 bytes each, so nothing of value is
-         * behind this gate. */
+        /* Two data-driven gates, both over the whole block.  The first is a
+         * spread duplication test (see ref_dup_frac_best); an earlier
+         * version also encoded the first 32KB here, but that sample cannot
+         * see repeats living further in — layer-0 KV is a per-token lookup
+         * table whose rows repeat 2.3x and whose first 85 rows are distinct
+         * — and it cost 16% of compression time on FP4 weights, where the
+         * spread test says no before a byte is matched.  Matches shorter
+         * than the 16-byte window are worth ~3 bytes each, so nothing of
+         * value is behind that gate.  The second predicts whether matching
+         * can beat the main path at all; it is the one that pays for
+         * itself on data where duplication exists but matching still
+         * loses. */
         if (sl < 4096) { free(tok); return 0; }
-        if (ref_dup_frac(s, sl) < REF_DUP_MIN) { free(tok); return 0; }
+        size_t bestpos = 0, bestlen = 0;
+        if (ref_dup_frac_best(s, sl, &bestpos, &bestlen) < REF_DUP_MIN) { free(tok); return 0; }
+        /* Repeats exist, but can the matcher actually profit?  Predicting
+         * that is cheaper than finding out: the sample probe costs a
+         * fraction of a pass, and on the random-field log it saves the
+         * whole pass (13.4 vs 9.9 MB/s, identical output). */
+        if (!ref_profitable(s, sl, base_len, mo, bestpos, bestlen)) { free(tok); return 0; }
     }
     size_t tn = ref_encode(s, sl, tok, tcap);
     size_t res = 0;
