@@ -1,4 +1,5 @@
 #include "cpenc.h"
+#include <pthread.h>
 #include "bwt.h"
 #include <string.h>
 #include <stdlib.h>
@@ -232,6 +233,34 @@ static int seg_threads(size_t n_seg) {
 typedef struct { const uint8_t *src; size_t len; uint8_t *out; size_t cap; size_t outlen; int rc; int mo; } SegEncJob;
 int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl,
                         int mo, int no_bwt, int no_lz);
+/* Persistent workers with a shared counter.  Creating and joining a
+ * thread per batch of segments cost 59-127us per thread on the phone
+ * (measured), and an 8MB block has 128 segments — 8-16ms of thread
+ * management against ~44ms of actual compression, which is why 3 cores
+ * bought only 19%.  Now `nthr` threads are created once per block. */
+typedef struct {
+    const uint8_t *src; size_t sl; size_t n_seg;
+    SegEncJob *jobs; size_t next;
+    pthread_mutex_t mtx; int mo;
+} SegPool;
+static void *seg_pool_worker(void *arg) {
+    SegPool *p = arg;
+    for (;;) {
+        pthread_mutex_lock(&p->mtx);
+        size_t k = p->next < p->n_seg ? p->next++ : (size_t)-1;
+        pthread_mutex_unlock(&p->mtx);
+        if (k == (size_t)-1) break;
+        SegEncJob *j = &p->jobs[k];
+        size_t off = k * CPENC_SEG_SIZE;
+        size_t len = p->sl - off;
+        if (len > CPENC_SEG_SIZE) len = CPENC_SEG_SIZE;
+        size_t dl = j->cap;
+        j->src = p->src + off; j->len = len; j->mo = p->mo;
+        j->rc = cpenc_compress_impl(j->src, j->len, j->out, &dl, j->mo, 0, 1);
+        j->outlen = dl;
+    }
+    return NULL;
+}
 static void *seg_enc_worker(void *arg) {
     SegEncJob *j = arg;
     size_t dl = j->cap;
@@ -520,7 +549,12 @@ static size_t ref_encode(const uint8_t *s, size_t n, uint8_t *t, size_t cap) {
                      * compare at offset `best` rejects almost all of them;
                      * without it every candidate walked the full match
                      * length, which is most of the matcher's cost on
-                     * repetitive data. */
+                     * repetitive data.  The `i + best < n` guard is load
+                     * bearing: when the best match runs to the end of the
+                     * block, i + best == n and the compare reads one byte
+                     * past the buffer — harmless under glibc/musl, a
+                     * segfault on Android where the block lands against a
+                     * page boundary (found by ASAN on the phone). */
                     if (best && i + best < n && s[c + best] != s[i + best]) {
                         c = chain[c & REF_HMASK]; tries++; continue;
                     }
@@ -830,7 +864,6 @@ static size_t huff_size_exact(const uint8_t *p, size_t n, const uint32_t fq[256]
     for (int i = 0; i < 256; i++) if (fq[i]) hb += (size_t)fq[i] * lens[i];
     return 264 + (hb + 7) / 8;
 }
-#include <pthread.h>
 typedef struct {
     const uint8_t *data[2];  /* segment starts */
     const uint8_t *end[2];   /* segment ends */
@@ -1211,11 +1244,19 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                 jobs[k].mo = mo;
             }
             pthread_t th[16];
-            for (size_t base = 0; base < n_seg; base += (size_t)nthr) {
-                int nb = (int)(n_seg - base < (size_t)nthr ? n_seg - base : (size_t)nthr);
-                for (int i = 0; i < nb; i++) pthread_create(&th[i], NULL, seg_enc_worker, &jobs[base + i]);
-                for (int i = 0; i < nb; i++) pthread_join(th[i], NULL);
+            SegPool pool;
+            pool.src = s; pool.sl = sl; pool.n_seg = n_seg;
+            pool.jobs = jobs; pool.next = 0; pool.mo = mo;
+            pthread_mutex_init(&pool.mtx, NULL);
+            int made = 0;
+            for (int i = 0; i < nthr; i++)
+                if (pthread_create(&th[i], NULL, seg_pool_worker, &pool) == 0) made++;
+            if (!made) {   /* could not start any worker: do it inline */
+                pool.next = 0;
+                seg_pool_worker(&pool);
             }
+            for (int i = 0; i < made; i++) pthread_join(th[i], NULL);
+            pthread_mutex_destroy(&pool.mtx);
             for (size_t k = 0; k < n_seg; k++) {
                 if (jobs[k].rc != 0 || jobs[k].outlen > (size_t)(*dl - (op - d))) {
                     for (size_t j = 0; j < n_seg; j++) free(bufs[j]);
