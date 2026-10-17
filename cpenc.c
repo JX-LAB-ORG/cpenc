@@ -1157,7 +1157,9 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                 double e2=ent(trial,sample);if(e2<best_e-0.01){best_o=2;best_e=e2;}}
             if(mo>=3 && best_e>1.0){memcpy(trial,gp,sample);de(trial,sample,3);
                 double e3=ent(trial,sample);if(e3<best_e-0.01){best_o=3;}}
-        }else if(sample_e>6.5){best_o=0;nraw++;}
+        }else if(sample_e>7.5){best_o=0;nraw++;}   /* 7.5, not 6.5: a 6.6-bit
+            * group still has ~17% of entropy coding in it (real FP8 weight
+            * blocks sit at 6.67 and were being stored RAW) */
         de(gp,gs,best_o);
         orders[g]=(uint8_t)best_o;
     }
