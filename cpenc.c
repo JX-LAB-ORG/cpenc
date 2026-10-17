@@ -1199,7 +1199,12 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * 1.17x.  The spread test below segments those without paying the
      * per-segment overhead on blocks that really are homogeneous. */
     int want_seg = (sl >= CPENC_SEG_MIN);
-    if (!want_seg && sl >= (128u << 10)) {
+    /* The spread test must not fire on a block that is already one
+     * segment: n_seg would be 1 and the recursive call would re-enter
+     * this branch with the same size — infinite recursion (a 256KB
+     * segment of records overflowed the stack the moment SEG_SIZE was
+     * raised above the 128KB test threshold). */
+    if (!want_seg && sl > CPENC_SEG_SIZE && sl >= (128u << 10)) {
         size_t w = 1024, nw = 16;
         double lo = 9.0, hi = 0.0;
         if (sl / w >= nw) {
@@ -1212,7 +1217,14 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             want_seg = (hi - lo) > 1.0;
         }
     }
-    if (want_seg && ent(s, 2048) >= 1.0) {
+    if (want_seg) {
+        size_t n_seg = (sl + CPENC_SEG_SIZE - 1) / CPENC_SEG_SIZE;
+        /* n_seg < 2 would recurse into this same branch at the same
+         * size; ent < 1.0 means a constant block, which the normal path
+         * encodes in a few bytes. */
+        if (n_seg < 2 || ent(s, 2048) < 1.0) want_seg = 0;
+    }
+    if (want_seg) {
         size_t n_seg = (sl + CPENC_SEG_SIZE - 1) / CPENC_SEG_SIZE;
         size_t ext = hex_mode ? 1 : 0;      /* real-stride byte for hex wrapper */
         size_t need = CPENC_HEADER_SIZE + ext + 4 + n_seg * 4;
