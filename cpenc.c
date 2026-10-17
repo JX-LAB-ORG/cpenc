@@ -217,11 +217,13 @@ static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n);
  * threads.  Opt-in: default auto (only for enough segments),
  * CPENC_THREADS=N forces N, CPENC_NO_THREADS=1 forces 1 (PRoot's
  * scheduler can wedge under load — the env fallback stays). */
+static _Thread_local int t_in_worker = 0;
 static int seg_threads(size_t n_seg) {
     /* default single-threaded: PRoot's scheduler penalizes threads,
      * and small blocks lose to thread setup.  CPENC_THREADS=N opts in
      * (real hardware / servers); CPENC_NO_THREADS=1 forces off. */
     const char *ts = getenv("CPENC_THREADS");
+    if (t_in_worker) return 1;      /* never spawn threads inside a worker */
     if (getenv("CPENC_NO_THREADS")) return 1;
     if (!ts) return 1;
     int n = atoi(ts);
@@ -239,7 +241,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl,
  * management against ~44ms of actual compression, which is why 3 cores
  * bought only 19%.  Now `nthr` threads are created once per block. */
 typedef struct {
-    const uint8_t *src; size_t sl; size_t n_seg;
+    const uint8_t *src; size_t sl; size_t n_seg; size_t seg_sz;
     SegEncJob *jobs; size_t next;
     pthread_mutex_t mtx; int mo;
 } SegPool;
@@ -251,12 +253,14 @@ static void *seg_pool_worker(void *arg) {
         pthread_mutex_unlock(&p->mtx);
         if (k == (size_t)-1) break;
         SegEncJob *j = &p->jobs[k];
-        size_t off = k * CPENC_SEG_SIZE;
+        size_t off = k * p->seg_sz;
         size_t len = p->sl - off;
-        if (len > CPENC_SEG_SIZE) len = CPENC_SEG_SIZE;
+        if (len > p->seg_sz) len = p->seg_sz;
         size_t dl = j->cap;
         j->src = p->src + off; j->len = len; j->mo = p->mo;
+        t_in_worker++;                 /* no nested pools */
         j->rc = cpenc_compress_impl(j->src, j->len, j->out, &dl, j->mo, 0, 1);
+        t_in_worker--;
         j->outlen = dl;
     }
     return NULL;
@@ -1217,15 +1221,25 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             want_seg = (hi - lo) > 1.0;
         }
     }
-    if (want_seg) {
-        size_t n_seg = (sl + CPENC_SEG_SIZE - 1) / CPENC_SEG_SIZE;
-        /* n_seg < 2 would recurse into this same branch at the same
-         * size; ent < 1.0 means a constant block, which the normal path
-         * encodes in a few bytes. */
-        if (n_seg < 2 || ent(s, 2048) < 1.0) want_seg = 0;
+    /* Segment size.  SEG_SIZE is the content-isolation granularity (big
+     * enough that the per-segment table costs fade, small enough to keep
+     * mixed regions apart).  When threads are requested the block is cut
+     * into one big chunk per core instead — a 64KB piece per thread is
+     * too fine to be worth a task. */
+    size_t seg_sz = CPENC_SEG_SIZE;
+    int nthr = seg_threads(16);
+    if (nthr > 1) {
+        size_t per = (sl + (size_t)nthr - 1) / (size_t)nthr;
+        if (per > seg_sz) seg_sz = per;
     }
+    if (sl < 2 * seg_sz) seg_sz = (64u << 10);   /* too small to split coarsely */
+    size_t n_seg = want_seg ? (sl + seg_sz - 1) / seg_sz : 0;
+    /* n_seg < 2 would recurse into this same branch at the same size;
+     * ent < 1.0 means a constant block, which the normal path encodes in
+     * a few bytes. */
+    if (want_seg && (n_seg < 2 || ent(s, 2048) < 1.0)) want_seg = 0;
+    if (want_seg && (size_t)nthr > n_seg) nthr = (int)n_seg;
     if (want_seg) {
-        size_t n_seg = (sl + CPENC_SEG_SIZE - 1) / CPENC_SEG_SIZE;
         size_t ext = hex_mode ? 1 : 0;      /* real-stride byte for hex wrapper */
         size_t need = CPENC_HEADER_SIZE + ext + 4 + n_seg * 4;
         if (*dl < need) { free(hexbuf); return -1; }
@@ -1238,7 +1252,6 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         *op++ = (uint8_t)((n_seg >> 16) & 0xFF); *op++ = (uint8_t)((n_seg >> 24) & 0xFF);
         uint8_t *lenp = op;
         op += n_seg * 4;
-        int nthr = seg_threads(n_seg);
         if (nthr > 1) {
             /* parallel: each segment compresses into its own buffer,
              * then a sequential pass assembles the stream */
@@ -1246,18 +1259,18 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             SegEncJob *jobs = calloc(n_seg, sizeof(SegEncJob));
             if (!bufs || !jobs) { free(bufs); free(jobs); free(hexbuf); return -1; }
             for (size_t k = 0; k < n_seg; k++) {
-                bufs[k] = malloc(cpenc_max_compressed_size(CPENC_SEG_SIZE) + 64);
+                bufs[k] = malloc(cpenc_max_compressed_size(seg_sz) + 64);
                 if (!bufs[k]) { for (size_t j = 0; j < k; j++) free(bufs[j]); free(bufs); free(jobs); free(hexbuf); return -1; }
-                jobs[k].src = s + k * CPENC_SEG_SIZE;
-                jobs[k].len = sl - k * CPENC_SEG_SIZE;
-                if (jobs[k].len > CPENC_SEG_SIZE) jobs[k].len = CPENC_SEG_SIZE;
+                jobs[k].src = s + k * seg_sz;
+                jobs[k].len = sl - k * seg_sz;
+                if (jobs[k].len > seg_sz) jobs[k].len = seg_sz;
                 jobs[k].out = bufs[k];
-                jobs[k].cap = cpenc_max_compressed_size(CPENC_SEG_SIZE) + 64;
+                jobs[k].cap = cpenc_max_compressed_size(seg_sz) + 64;
                 jobs[k].mo = mo;
             }
             pthread_t th[16];
             SegPool pool;
-            pool.src = s; pool.sl = sl; pool.n_seg = n_seg;
+            pool.src = s; pool.sl = sl; pool.n_seg = n_seg; pool.seg_sz = seg_sz;
             pool.jobs = jobs; pool.next = 0; pool.mo = mo;
             pthread_mutex_init(&pool.mtx, NULL);
             int made = 0;
@@ -1285,9 +1298,9 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             free(bufs); free(jobs);
         } else {
             for (size_t k = 0; k < n_seg; k++) {
-                size_t seg_off = k * CPENC_SEG_SIZE;
+                size_t seg_off = k * seg_sz;
                 size_t seg_len = sl - seg_off;
-                if (seg_len > CPENC_SEG_SIZE) seg_len = CPENC_SEG_SIZE;
+                if (seg_len > seg_sz) seg_len = seg_sz;
                 size_t clen = (size_t)(*dl - (op - d));
                 if (cpenc_compress_impl(s + seg_off, seg_len, op, &clen, mo, 0, 1) != 0) {
                     free(hexbuf); return -1;
@@ -1932,7 +1945,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         if(sl < CPENC_HEADER_SIZE + 4) return -1;
         uint32_t n_seg = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
         p += 4;
-        uint32_t max_seg = (h->original_size + CPENC_SEG_SIZE - 1) / CPENC_SEG_SIZE;
+        uint32_t max_seg = h->original_size / 4 + 1;   /* segments are an encoder choice */
         if(n_seg < 1 || n_seg > max_seg) return -1;
         if(sl < CPENC_HEADER_SIZE + 4 + (size_t)n_seg * 4) return -1;
         const uint8_t *sp = p + (size_t)n_seg * 4;
@@ -1951,8 +1964,12 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             if (!bufs || !jobs) { free(bufs); free(jobs); return -1; }
             for (uint32_t k = 0; k < n_seg; k++) {
                 uint32_t clen = (uint32_t)p[k*4] | ((uint32_t)p[k*4+1]<<8) | ((uint32_t)p[k*4+2]<<16) | ((uint32_t)p[k*4+3]<<24);
-                size_t dl_k = h->original_size - (size_t)k * CPENC_SEG_SIZE;
-                if (dl_k > CPENC_SEG_SIZE) dl_k = CPENC_SEG_SIZE;
+                /* Segment sizes are an encoder choice; the stream only
+                 * stores each sub-block's compressed length.  Its own
+                 * header carries original_size, so read it rather than
+                 * assuming a fixed granularity. */
+                if (clen < CPENC_HEADER_SIZE) { for (uint32_t j = 0; j < k; j++) free(bufs[j]); free(bufs); free(jobs); return -1; }
+                size_t dl_k = (size_t)sp[4] | ((size_t)sp[5] << 8) | ((size_t)sp[6] << 16) | ((size_t)sp[7] << 24);
                 bufs[k] = malloc(dl_k ? dl_k : 1);
                 if (!bufs[k]) { for (uint32_t j = 0; j < k; j++) free(bufs[j]); free(bufs); free(jobs); return -1; }
                 jobs[k].src = sp; jobs[k].clen = clen;
@@ -1986,13 +2003,11 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         size_t o = 0;
         for(uint32_t k = 0; k < n_seg; k++) {
             uint32_t clen = (uint32_t)p[k*4] | ((uint32_t)p[k*4+1]<<8) | ((uint32_t)p[k*4+2]<<16) | ((uint32_t)p[k*4+3]<<24);
-            size_t dl_k = h->original_size - o;
-            if(dl_k > CPENC_SEG_SIZE) dl_k = CPENC_SEG_SIZE;
+            size_t dl_k = (size_t)sp[4] | ((size_t)sp[5] << 8) | ((size_t)sp[6] << 16) | ((size_t)sp[7] << 24);
             if((size_t)*dl < o + dl_k) return -1;
+            size_t hdr_len = dl_k;
             if(cpenc_decompress(sp, clen, d + o, &dl_k) != 0) return -1;
-            size_t want = h->original_size - o;
-            if(want > CPENC_SEG_SIZE) want = CPENC_SEG_SIZE;
-            if(dl_k != want) return -1;
+            if(dl_k != hdr_len) return -1;
             o += dl_k;
             sp += clen;
         }

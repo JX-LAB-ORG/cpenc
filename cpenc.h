@@ -24,7 +24,7 @@ extern "C" {
  * repeat, even if the head sample looked unmatchable. */
 #define REF_DUP_MIN 0.10
 #define CPENC_LAG_NONE 0
-#define CPENC_SEG_SIZE  (64u << 10)   /* segment granularity */
+#define CPENC_SEG_SIZE  (512u << 10)  /* content-isolation granularity: 64KB segments spent ~35% of a structured table on per-segment tables */
 #define CPENC_SEG_MIN   (1u << 20)    /* block must be >= 1MB to segment */
 #define CPENC_LAG_MIN  16
 #define CPENC_LAG_MAX  255      /* lag byte stores the lag itself */
