@@ -758,7 +758,12 @@ static double ref_dup_frac(const uint8_t *s, size_t n) {
 static size_t ref_try(const uint8_t *s, size_t sl, uint8_t *d, size_t cap,
                      size_t base_len, int mo) {
     if (sl < 4096) return 0;
-    if (base_len * 4 <= sl) return 0;          /* main path already beats 4x */
+    /* No "main path is already good enough" shortcut here.  It cost a
+     * periodic table 31x: the main path reached 95x and the reference
+     * layer was never given a chance, when matching the 4KB period takes
+     * it to 3013x.  The duplication sample below is the right gate —
+     * it looks at the data, not at what the main path scored — and on
+     * records, text and random data the outcome is unchanged. */
     size_t tcap = sl + sl / 64 + 64;
     uint8_t *tok = malloc(tcap);
     if (!tok) return 0;
