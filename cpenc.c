@@ -133,7 +133,7 @@ static HPair hp_pop(HPair *h,int *n){
     while(2*i+1<*n){int c=2*i+1;if(c+1<*n&&h[c+1].f<h[c].f)c++;if(h[i].f<=h[c].f)break;HPair t=h[i];h[i]=h[c];h[c]=t;i=c;}
     return r;
 }
-static void hlens(uint32_t fq[256],uint8_t lens[256]){
+static void hlens(const uint32_t fq[256],uint8_t lens[256]){
     memset(lens,0,256);
     uint32_t f[256];
     memcpy(f, fq, sizeof(f));
@@ -247,11 +247,6 @@ static void *seg_dec_worker(void *arg) {
 }
 /* ── const+exceptions sub-block (subtag 4): [len u32][cval u8][nex u32]
  *    [pos LEB128][val u8] each — for streams dominated by one symbol ── */
-static size_t sub5_estimate(const uint32_t cnt[256], size_t n) {
-    uint32_t dom = 0;
-    for (int i = 0; i < 256; i++) if (cnt[i] > dom) dom = cnt[i];
-    return 9 + (size_t)(n - dom) * 5;
-}
 static int sub5_encode(uint8_t **po, const uint8_t *edd, const uint8_t *sym,
                        size_t n, const uint32_t cnt[256]) {
     uint8_t *out = *po;
@@ -353,6 +348,85 @@ static int leb_put(uint8_t *p, uint32_t v) {
     return n;
 }
 static int leb_len(uint32_t v) { int n = 1; while (v >= 128) { v >>= 7; n++; } return n; }
+/* Exact byte size of the subtag-4 (const+exceptions) encoding of one
+ * sub-stream: [len u32][cval u8][nex u32] + per exception (pos LEB)(val). */
+static size_t sub5_abs_size(const uint32_t cnt[256], const uint8_t *sym, size_t n) {
+    uint32_t dom = 0, domv = 0;
+    for (int i = 0; i < 256; i++) if (cnt[i] > dom) { dom = cnt[i]; domv = (uint32_t)i; }
+    size_t sz = 9;
+    for (size_t k = 0; k < n; k++)
+        if (sym[k] != (uint8_t)domv) sz += (size_t)leb_len((uint32_t)k) + 1;
+    return sz;
+}
+/* Choose the cheapest subtag (0 const, 1 LUT, 2 Huffman, 3 RAW, 4 const+
+ * exceptions) for the RLE runs/vals sub-streams and return its EXACT
+ * encoded size, including the subtag byte.  The estimate and the emit
+ * both call this, so a group's tag-4 bid is its real byte count — the old
+ * inline estimates used floor-plus-slack and an entropy guess, and could
+ * under- or overbid by thousands of bytes on long streams. */
+static int sub_choose(const uint32_t cnt[256], const uint8_t *sym, size_t n, size_t *psz) {
+    int nz = 0; for (int i = 0; i < 256; i++) if (cnt[i]) nz++;
+    if (nz <= 1) { *psz = 7; return 0; }   /* st+len u32+val+nz-1 */
+    int bits = 1; while ((1 << bits) < nz && bits < HUFF_MAX) bits++;
+    size_t sz_lut = 6 + (size_t)nz + ((size_t)n * (size_t)bits + 7) / 8;
+    uint8_t lens[256]; hlens(cnt, lens);
+    size_t hbits = 0;
+    for (int i = 0; i < 256; i++) if (cnt[i]) hbits += (size_t)cnt[i] * lens[i];
+    size_t sz_h = 1 + 264 + (hbits + 7) / 8;
+    size_t sz_raw = 5 + n;
+    size_t sz_s5 = 1 + sub5_abs_size(cnt, sym, n);
+    int st = 1; size_t best = sz_lut;
+    if (sz_h < best) { best = sz_h; st = 2; }
+    if (sz_raw < best) { best = sz_raw; st = 3; }
+    if (sz_s5 < best) { best = sz_s5; st = 4; }
+    *psz = best;
+    return st;
+}
+/* Build the tag-4 (RLE) streams for a zero-heavy group: run lengths,
+ * nonzero values, escaped 8-bit run stream, exact payload size, and the
+ * chosen subtag for each sub-stream.  Selection and emit both call this,
+ * so a group's RLE bid is the size it will actually occupy. */
+static int rle_build(const uint8_t *gp, size_t gs,
+                     uint32_t **pruns, uint8_t **pvls, size_t *pnv,
+                     uint8_t **pr8, size_t *pnr8, size_t *psz,
+                     int *pst_r, int *pst_v) {
+    uint32_t *runs = malloc((gs/2+2)*sizeof(uint32_t));
+    uint8_t *vls = malloc(gs);
+    if (!runs || !vls) { free(runs); free(vls); return -1; }
+    size_t nr = 0, nv = 0, i;
+    if (gp[0] != 0) runs[nr++] = 0;
+    for (i = 0; i < gs;) {
+        if (gp[i] == 0) {
+            size_t j = i; while (j < gs && gp[j] == 0) j++;
+            runs[nr++] = (uint32_t)(j - i); i = j;
+        } else {
+            if (i > 0 && gp[i-1] != 0) runs[nr++] = 0;
+            vls[nv++] = gp[i]; i++;
+        }
+    }
+    uint8_t *r8 = malloc(nr*5+2);
+    if (!r8) { free(runs); free(vls); return -1; }
+    size_t nr8 = 0;
+    for (size_t k = 0; k < nr; k++) {
+        if (runs[k] < 255) r8[nr8++] = (uint8_t)runs[k];
+        else {
+            r8[nr8++] = 255;
+            uint32_t r = runs[k] - 255;
+            do { uint8_t b = (uint8_t)(r & 0x7F); r >>= 7;
+                 if (r) b |= 0x80;
+                 r8[nr8++] = b; } while (r);
+        }
+    }
+    uint32_t rq[256] = {0}; for (size_t k = 0; k < nr8; k++) rq[r8[k]]++;
+    uint32_t vq[256] = {0}; for (size_t k = 0; k < nv; k++) vq[vls[k]]++;
+    size_t s_r, s_v;
+    *pst_r = sub_choose(rq, r8, nr8, &s_r);
+    *pst_v = sub_choose(vq, vls, nv, &s_v);
+    *psz = s_r + s_v;
+    *pruns = runs; *pvls = vls; *pr8 = r8;
+    *pnv = nv; *pnr8 = nr8;
+    return 0;
+}
 /* Returns token-stream length, or 0 if the block is not worth matching. */
 static size_t ref_encode(const uint8_t *s, size_t n, uint8_t *t, size_t cap) {
     if (n < 256) return 0;
@@ -620,6 +694,31 @@ static uint32_t h_enc_seg(const uint8_t *d, size_t n, uint8_t *ob, size_t cap) {
         (void)ln;
     }
     return (uint32_t)(lp - ob);
+}
+/* Exact size of the Huffman payload emitted for a whole group: h_enc, or
+ * h_enc_seg once the group crosses 1MB.  Computing the size from the code
+ * lengths avoids an entropy estimate whose error (even 1%) is thousands of
+ * bytes on an 8MB group. */
+static size_t huff_size_exact(const uint8_t *p, size_t n, const uint32_t fq[256]) {
+    if (n >= (1u << 20)) {
+        size_t segn = (n + HUFF_SEGS - 1) / HUFF_SEGS;
+        size_t total = 1 + 4 * HUFF_SEGS;
+        for (int k = 0; k < HUFF_SEGS; k++) {
+            size_t off = (size_t)k * segn;
+            size_t ln = (off + segn <= n) ? segn : n - off;
+            if (!ln) continue;
+            uint32_t f2[256]; freq256(p + off, ln, f2);
+            uint8_t lens[256]; hlens(f2, lens);
+            size_t hb = 0;
+            for (int i = 0; i < 256; i++) if (f2[i]) hb += (size_t)f2[i] * lens[i];
+            total += 264 + (hb + 7) / 8;
+        }
+        return total;
+    }
+    uint8_t lens[256]; hlens(fq, lens);
+    size_t hb = 0;
+    for (int i = 0; i < 256; i++) if (fq[i]) hb += (size_t)fq[i] * lens[i];
+    return 264 + (hb + 7) / 8;
 }
 #include <pthread.h>
 typedef struct {
@@ -1198,23 +1297,17 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         int nz=0;for(int i=0;i<256;i++)if(fq[i])nz++;
 
         size_t sz_raw=4+gs; uint8_t tag;
-        /* Exact Huffman size from the code lengths.  This used to be an
-         * entropy estimate with a 3% safety margin, and at 8MB that margin
-         * is ~245KB — far more than Huffman's real overhead — so any gain
-         * under 3% was silently forfeited to RAW.  On real Q4_K_M weights
-         * (entropy 7.785, limit 1.0276x) that gave 0.9997x while gzip
-         * reached 1.0223x.  Building the lengths costs one small tree, and
-         * the encode path needs them anyway. */
-        uint8_t hl_est[256];
-        hlens(fq, hl_est);
-        size_t hbits = 0;
-        for (int i = 0; i < 256; i++) if (fq[i]) hbits += (size_t)fq[i] * hl_est[i];
-        size_t sz_h = 264 + (hbits + 7) / 8;
+        /* Every candidate's bid is its exact emitted byte count, so the
+         * tag competition is a true minimum.  Entropy estimates with a
+         * safety margin used to forfeit gains under 3% (at 8MB that margin
+         * is ~245KB); on real Q4_K_M weights that gave 0.9997x where gzip
+         * reached 1.0223x. */
+        size_t sz_h = huff_size_exact(gp, gs, fq);
 
         if(nz<=1){tag=0;}
         else{
             int bits=1;while((1<<bits)<nz&&bits<HUFF_MAX)bits++;
-            size_t sz_l=6+(size_t)nz+gs*(size_t)bits/8+5;
+            size_t sz_l=6+(size_t)nz+((size_t)gs*(size_t)bits+7)/8;
             size_t sz_best=sz_raw; tag=3;
             if(sz_l<sz_best){tag=1;sz_best=sz_l;}
             if(sz_h<sz_best){tag=2;sz_best=sz_h;}
@@ -1224,13 +1317,23 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
              * symbol all-zero bitstream.  Complements RLE (zeros) with
              * non-zero constants (e.g. transposed struct groups). */
             {
-                uint32_t dom = 0;
-                for (int i2 = 0; i2 < 256; i2++) if (fq[i2] > dom) { dom = fq[i2]; }
+                uint32_t dom = 0, domv = 0;
+                for (int i2 = 0; i2 < 256; i2++)
+                    if (fq[i2] > dom) { dom = fq[i2]; domv = (uint32_t)i2; }
                 if (dom > (uint32_t)gs - gs/10 && dom < (uint32_t)gs && gs >= 1024) {
-                    /* estimate: cval(2) + count(4) + gap-LEB128 pos (avg 2B) + value */
-                    uint32_t nex = (uint32_t)gs - dom;
-                    size_t sz_c = 6 + (size_t)nex*3;
-                    if (sz_c < sz_best) { tag = 5; }
+                    /* Exact: [val u16][nex u32] + per exception (gap LEB)(val).
+                     * The old 3-byte-per-exception guess both overbid short
+                     * gaps and ignored long ones. */
+                    size_t sz_c = 6;
+                    uint32_t prev = 0; int first = 1;
+                    for (size_t i2 = 0; i2 < gs; i2++)
+                        if (gp[i2] != (uint8_t)domv) {
+                            uint32_t pos = (uint32_t)i2;
+                            uint32_t enc = first ? pos : (pos - prev - 1);
+                            first = 0; prev = pos;
+                            sz_c += (size_t)leb_len(enc) + 1;
+                        }
+                    if (sz_c < sz_best) { tag = 5; sz_best = sz_c; }
                 }
             }
             /* RLE candidate (tag 4): zero-heavy groups get run-length coded.
@@ -1241,70 +1344,28 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
              * groups) because the alternating-stream bound 2nv+1 overestimates
              * clustered zeros by ~5x and would steer them to Huffman. */
             if(fq[0] > (uint32_t)gs/2 && gs >= 64){
-                size_t nv = (size_t)gs - fq[0];
-                size_t nr = 0; int inz = 0;
-                for (size_t i2 = 0; i2 < gs; i2++) {
-                    if (!gp[i2]) { if (!inz) { nr++; inz = 1; } }
-                    else inz = 0;
+                uint32_t *runs; uint8_t *vls, *r8; size_t nv, nr8, sz_rle;
+                int st_r, st_v;
+                if (rle_build(gp, gs, &runs, &vls, &nv, &r8, &nr8, &sz_rle,
+                              &st_r, &st_v) == 0) {
+                    if (sz_rle < sz_best) { tag = 4; sz_best = sz_rle; }
+                    free(r8); free(runs); free(vls);
                 }
-                /* value sub-stream gets its own tag; entropy of the nonzero
-                 * symbols (RAW sizing overestimated it ~40% on MTF streams,
-                 * steering RLE to Huffman) */
-                double ve = 0;
-                if (nv) {
-                    for (int i2 = 1; i2 < 256; i2++)
-                        if (fq[i2]) { double pr = (double)fq[i2]/nv; ve -= pr*log2(pr); }
-                }
-                size_t v_est = 264 + (size_t)(nv*ve/8.0*103/100) + 16;
-                size_t sz_rle = 2 + (4 + nr + nr/5) + (4 + v_est);
-                if(sz_rle<sz_best){tag=4;}
             }
         }
 
         if(out>=edd){free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;} *out++=tag;
         if(tag==4){
-            /* RLE: rebuild streams and encode both sub-blocks with the
-             * standard per-subtag machinery (constants/LUT/Huffman/RAW) */
-            uint32_t *runs = malloc((gs/2+2)*sizeof(uint32_t));
-            uint8_t *vls = malloc(gs);
-            if(!runs||!vls){free(runs);free(vls);free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
-            size_t nr=0,nv=0,i;
-            if(gp[0]!=0) runs[nr++]=0;
-            for(i=0;i<gs;){
-                if(gp[i]==0){size_t j=i;while(j<gs&&gp[j]==0)j++;
-                    runs[nr++]=(uint32_t)(j-i);i=j;}
-                else{if(i>0&&gp[i-1]!=0)runs[nr++]=0;
-                    vls[nv++]=gp[i];i++;}
+            /* RLE: the same builder that priced the group; its subtag
+             * choices are the ones the bid was computed from. */
+            uint32_t *runs; uint8_t *vls, *r8; size_t nv, nr8, sz_rle;
+            int st, st_v;
+            if (rle_build(gp, gs, &runs, &vls, &nv, &r8, &nr8, &sz_rle,
+                          &st, &st_v) != 0) {
+                free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;
             }
-            uint8_t *r8=malloc(nr*5+2);
-            if(!r8){free(runs);free(vls);free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
-            size_t nr8=0;
-            for(size_t k=0;k<nr;k++){
-                if(runs[k]<255){r8[nr8++]=(uint8_t)runs[k];}
-                else{r8[nr8++]=255;   /* escape: length-255 remainder in LEB128 */
-                    uint32_t r=runs[k]-255;
-                    do{uint8_t b=(uint8_t)(r&0x7F);r>>=7;
-                        if(r)b|=0x80;
-                        r8[nr8++]=b;}while(r);}
-            }
-
-            /* encode runs sub-block (subtag) */
             uint32_t rq[256]={0};for(size_t k=0;k<nr8;k++)rq[r8[k]]++;
             int rnz=0;for(int i2=0;i2<256;i2++)if(rq[i2])rnz++;
-            uint8_t st;
-            if(rnz<=1)st=0;
-            else{
-                int rb=1;while((1<<rb)<rnz&&rb<HUFF_MAX)rb++;
-                size_t sl=6+rnz+nr8*(size_t)rb/8+5;
-                double re=fq_ent(rq,nr8);size_t hp=(size_t)(nr8*re/8.0);if(hp<nr8/8)hp=nr8/8;
-                size_t sh=264+hp*103/100+16;
-                size_t raw=4+nr8;
-                size_t s5=sub5_estimate(rq,nr8);
-                size_t best=sl; st=1;
-                if(sh<best){best=sh;st=2;}
-                if(raw<best){best=raw;st=3;}
-                if(s5<best){best=s5;st=4;}
-            }
             if(out>=edd){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
             *out++=st;
             if(st==0){
@@ -1341,19 +1402,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             /* encode vals sub-block */
             uint32_t vq[256]={0};for(size_t k=0;k<nv;k++)vq[vls[k]]++;
             int vnz=0;for(int i2=0;i2<256;i2++)if(vq[i2])vnz++;
-            if(vnz<=1)st=0;
-            else{
-                int vb=1;while((1<<vb)<vnz&&vb<HUFF_MAX)vb++;
-                size_t sl=6+vnz+nv*(size_t)vb/8+5;
-                double ve=fq_ent(vq,nv);size_t hp=(size_t)(nv*ve/8.0);if(hp<nv/8)hp=nv/8;
-                size_t sh=264+hp*103/100+16;
-                size_t raw=4+nv;
-                size_t s5=sub5_estimate(vq,nv);
-                size_t best=sl; st=1;
-                if(sh<best){best=sh;st=2;}
-                if(raw<best){best=raw;st=3;}
-                if(s5<best){best=s5;st=4;}
-            }
+            st=st_v;
             if(out>=edd){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
             *out++=st;
             if(st==0){
