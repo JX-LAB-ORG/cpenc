@@ -230,10 +230,16 @@ static int seg_threads(size_t n_seg) {
     return n;
 }
 typedef struct { const uint8_t *src; size_t len; uint8_t *out; size_t cap; size_t outlen; int rc; int mo; } SegEncJob;
+int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl,
+                        int mo, int no_bwt, int no_lz);
 static void *seg_enc_worker(void *arg) {
     SegEncJob *j = arg;
     size_t dl = j->cap;
-    j->rc = cpenc_compress(j->src, j->len, j->out, &dl, j->mo);
+    /* no_lz, like the sequential path: a segment has no predecessor, and
+     * the match layer runs once over the whole block after segmentation.
+     * Calling the public wrapper here left it on per segment, which cost
+     * FP4 22% and changed the output for the same input. */
+    j->rc = cpenc_compress_impl(j->src, j->len, j->out, &dl, j->mo, 0, 1);
     j->outlen = dl;
     return NULL;
 }
