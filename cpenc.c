@@ -1082,7 +1082,10 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * so the RAW decode path's lag restore is a no-op. */
     if (sl >= 1024) {
         double seg_e = ent(s, sl);
-        if (seg_e > 7.5) {
+        /* 7.9, not 7.5: real Q4_K_M weights sit at 7.78 and still have
+         * 2.7% of entropy coding in them.  Truly random data is 7.9998, so
+         * this still short-circuits the genuinely incompressible case. */
+        if (seg_e > 7.9) {
             size_t ext = hex_mode ? 2 : 1;
             if (*dl < CPENC_HEADER_SIZE + ext + sl) { free(lagbuf); free(hexbuf); return -1; }
             /* Near-random *bytes* can still be a repeated record with a few
@@ -1193,17 +1196,18 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         int nz=0;for(int i=0;i<256;i++)if(fq[i])nz++;
 
         size_t sz_raw=4+gs; uint8_t tag;
-        double gp_ent=fq_ent(fq,gs);
-        /* huffman min length is 1 bit/symbol for the dominant symbol:
-         * the bitstream floor is gs/8 bytes, not gs/32 (was badly
-         * underestimating skewed groups, steering them to Huffman) */
-        size_t h_p=(size_t)(gs*gp_ent/8.0);if(h_p<gs/8)h_p=gs/8;
-        /* zero-dense groups (BWT+MTF output, sparse): Huffman's actual code
-         * length runs ~1.75x the entropy floor — the 0 gets 1 bit but the
-         * long tail of sparse ranks eats the rest.  Without this, Huffman
-         * estimate beats RLE and loses ~2x ratio (measured on MTF streams). */
-        if (fq[0] > (uint32_t)gs/2) h_p = h_p * 175 / 100;
-        size_t sz_h=264+h_p*103/100+16;
+        /* Exact Huffman size from the code lengths.  This used to be an
+         * entropy estimate with a 3% safety margin, and at 8MB that margin
+         * is ~245KB — far more than Huffman's real overhead — so any gain
+         * under 3% was silently forfeited to RAW.  On real Q4_K_M weights
+         * (entropy 7.785, limit 1.0276x) that gave 0.9997x while gzip
+         * reached 1.0223x.  Building the lengths costs one small tree, and
+         * the encode path needs them anyway. */
+        uint8_t hl_est[256];
+        hlens(fq, hl_est);
+        size_t hbits = 0;
+        for (int i = 0; i < 256; i++) if (fq[i]) hbits += (size_t)fq[i] * hl_est[i];
+        size_t sz_h = 264 + (hbits + 7) / 8;
 
         if(nz<=1){tag=0;}
         else{
