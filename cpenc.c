@@ -684,7 +684,7 @@ static uint64_t ref_h16(const uint8_t *p) {
  * match layer.  Keeping one position in 16 by a hash of the bytes there
  * keeps both copies of a repeated region together whatever the distance. */
 static double ref_dup_frac(const uint8_t *s, size_t n) {
-    if (n < 8192 || n > 0x7FFFFFF0u) return 0.0;
+    if (n < 4096 || n > 0x7FFFFFF0u) return 0.0;
     int32_t *tab = malloc(65536 * sizeof(int32_t));
     if (!tab) return 1.0;                     /* short on memory: be permissive */
     for (int i = 0; i < 65536; i++) tab[i] = -1;
@@ -724,17 +724,16 @@ static size_t ref_try(const uint8_t *s, size_t sl, uint8_t *d, size_t cap,
      * 32KB is 0.4% of an 8MB block and 15% of a 220KB one — the latter
      * costs absolute milliseconds, which is the right trade. */
     {
-        size_t pn = sl < 32768 ? sl : 32768;
-        if (pn < 4096) { free(tok); return 0; }
-        size_t pt = ref_encode(s, pn, tok, tcap);
-        if (!pt || pt * 13 > pn * 10) {          /* under 1.3x on the sample */
-            /* The head sample cannot see repeats living further into the
-             * block.  Layer-0 KV is a per-token lookup table whose rows
-             * repeat 2.3x, but its first 85 rows happen to be distinct, so
-             * the layer was skipped and the block stored at 1.16x where
-             * matching reaches 1.88x.  A cheap spread sample decides. */
-            if (ref_dup_frac(s, sl) < REF_DUP_MIN) { free(tok); return 0; }
-        }
+        /* One gate, measured over the whole block.  It used to encode the
+         * first 32KB as well, but that sample cannot see repeats living
+         * further in — layer-0 KV is a per-token lookup table whose rows
+         * repeat 2.3x and whose first 85 rows are distinct — and it cost
+         * 16% of compression time on FP4 weights, where the spread test
+         * says no before a byte is matched.  Matches shorter than the
+         * 16-byte window are worth ~3 bytes each, so nothing of value is
+         * behind this gate. */
+        if (sl < 4096) { free(tok); return 0; }
+        if (ref_dup_frac(s, sl) < REF_DUP_MIN) { free(tok); return 0; }
     }
     size_t tn = ref_encode(s, sl, tok, tcap);
     size_t res = 0;
@@ -1055,7 +1054,28 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * [(idx LEB128)(char)]*n_sep [bin bytes]. */
     int hex_mode = 0;
     uint8_t *hexbuf = NULL;
-    if (sl >= 256) {
+    /* Sampling gate first: deciding whether to try the hex layer by
+     * scanning every byte costs 12-18ms on an 8MB block — 18% of total
+     * compression time, and 39% on a small KV block.  Binary data has
+     * 22/256 = 8.6% hex characters and hex text is >=90%, so four spread
+     * windows separate them; anything in between still gets the exact
+     * scan, so the only risk is a hex file whose every sampled window
+     * looks binary. */
+    int hex_scan = (sl < 256) ? 0 : 1;
+    if (hex_scan && sl >= 8192) {
+        hex_scan = 0;
+        for (int k = 0; k < 4 && !hex_scan; k++) {
+            size_t off = (sl - 2048) * (size_t)k / 3;
+            size_t hx = 0;
+            for (size_t i = 0; i < 2048; i++) {
+                uint8_t c = s[off + i];
+                if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                    (c >= 'A' && c <= 'F')) hx++;
+            }
+            if (hx * 2 >= 2048) hex_scan = 1;      /* >=50%: look properly */
+        }
+    }
+    if (hex_scan) {
         size_t hexc = 0, badc = 0, hi_upper = 0, hi_lower = 0;
         for (size_t i = 0; i < sl; i++) {
             uint8_t c = s[i];
@@ -1372,16 +1392,33 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
     for(int g=0;g<stride;g++){
         uint8_t *gp = trans + (size_t)g*gs;
         int best_o=0;
+        /* One pass builds all four histograms.  Trying each order by
+         * copying the sample, differencing it and running an entropy pass
+         * costs ~11 traversals of the sample; this loop was 71% of
+         * compression time on structured tables.  The chained difference
+         * here is the same operator `de` applies in place. */
         size_t sample = gs<4096?gs:4096;
-        double sample_e = ent(gp, sample);
-        memcpy(trial,gp,sample); de(trial,sample,1);
-        double e1=ent(trial,sample);
+        uint32_t hq[4][256];
+        memset(hq, 0, sizeof(hq));
+        {
+            uint8_t a0p=0, a1p=0, a2p=0;
+            for (size_t i2 = 0; i2 < sample; i2++) {
+                uint8_t a0 = gp[i2];
+                uint8_t a1 = (uint8_t)(a0 - (i2 ? a0p : 0));
+                hq[0][a0]++; hq[1][a1]++;
+                uint8_t a2 = (uint8_t)(a1 - (i2 ? a1p : 0));
+                uint8_t a3 = (uint8_t)(a2 - (i2 ? a2p : 0));
+                if (mo>=2) hq[2][a2]++;
+                if (mo>=3) hq[3][a3]++;
+                a0p=a0; a1p=a1; a2p=a2;
+            }
+        }
+        double sample_e = fq_ent(hq[0], sample);
+        double e1 = fq_ent(hq[1], sample);
         if(e1<sample_e-0.3){
             best_o=1; double best_e=e1;
-            if(mo>=2 && best_e>1.0){memcpy(trial,gp,sample);de(trial,sample,2);
-                double e2=ent(trial,sample);if(e2<best_e-0.01){best_o=2;best_e=e2;}}
-            if(mo>=3 && best_e>1.0){memcpy(trial,gp,sample);de(trial,sample,3);
-                double e3=ent(trial,sample);if(e3<best_e-0.01){best_o=3;}}
+            if(mo>=2 && best_e>1.0){double e2=fq_ent(hq[2],sample);if(e2<best_e-0.01){best_o=2;best_e=e2;}}
+            if(mo>=3 && best_e>1.0){double e3=fq_ent(hq[3],sample);if(e3<best_e-0.01){best_o=3;}}
         }else if(sample_e>7.5){best_o=0;nraw++;}   /* 7.5, not 6.5: a 6.6-bit
             * group still has ~17% of entropy coding in it (real FP8 weight
             * blocks sit at 6.67 and were being stored RAW) */
