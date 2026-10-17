@@ -539,8 +539,11 @@ static size_t ref_try(const uint8_t *s, size_t sl, uint8_t *d, size_t cap,
     /* Probe the first 32KB before matching the whole block: data with no
      * repeats (random bytes, float noise) would otherwise pay a full pass
      * for nothing — measured 95 -> 2.9 MB/s on random at block size 8MB.
-     * The probe is 0.4% of an 8MB block and directly measures what the
-     * decision depends on. */
+     * Fixed 32KB, not a fraction: shrinking it to sl/16 made a 220KB
+     * heterogeneous block look unmatchable (its first 13KB really are
+     * nearly unique) and dropped that block from 2.53x to 1.59x.  The
+     * 32KB is 0.4% of an 8MB block and 15% of a 220KB one — the latter
+     * costs absolute milliseconds, which is the right trade. */
     {
         size_t pn = sl < 32768 ? sl : 32768;
         if (pn < 4096) { free(tok); return 0; }
