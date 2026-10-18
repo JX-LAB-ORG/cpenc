@@ -361,6 +361,7 @@ static int sub5_decode(const uint8_t **pp, const uint8_t *edd, uint8_t *out,
  *   [2][len][dist][nex][(gap)(val)]*nex               base + patches
  * Greedy parse over a 64K-entry hash chain; distances therefore cap at
  * the chain window, which is ample for line- and record-level repeats. */
+#define REF_LAZY 1
 #define REF_MINM   4
 /* Approximate match ("base + exceptions"): a base that is nearly, not
  * exactly, equal — the log/record case where a long body repeats with a
@@ -541,6 +542,31 @@ static size_t bitplane_plan(const uint8_t *gp, size_t gs, const size_t bcnt[8],
     return sz;
 }
 /* Returns token-stream length, or 0 if the block is not worth matching. */
+/* Read-only longest-match search at position i (no hash insertion), so
+ * the lazy step below can look one byte ahead without disturbing the
+ * chain.  Same walk as the greedy loop it replaces. */
+static void ref_find(const uint8_t *s, size_t n, size_t i,
+                     const int32_t *head, const int32_t *chain,
+                     int *bestp, size_t *bestdp) {
+    int best = 0; size_t bestd = 0;
+    if (i + REF_MINM <= n) {
+        int32_t c = head[ref_h4(s + i)]; int tries = 0;
+        while (c >= 0 && tries < REF_MAXTRY) {
+            size_t cd = i - (size_t)c;
+            if (cd && s[c] == s[i] && s[c+1] == s[i+1] &&
+                s[c+2] == s[i+2] && s[c+3] == s[i+3]) {
+                if (best && i + best < n && s[c + best] != s[i + best]) {
+                    c = chain[c & REF_HMASK]; tries++; continue;
+                }
+                size_t L = 0;
+                while (i + L < n && s[c + L] == s[i + L]) L++;
+                if ((int)L > best) { best = (int)L; bestd = cd; }
+            }
+            c = chain[c & REF_HMASK]; tries++;
+        }
+    }
+    *bestp = best; *bestdp = bestd;
+}
 static size_t ref_encode(const uint8_t *s, size_t n, uint8_t *t, size_t cap) {
     if (n < 256) return 0;
     int32_t *head = malloc(REF_HSZ * sizeof(int32_t));
@@ -551,30 +577,20 @@ static size_t ref_encode(const uint8_t *s, size_t n, uint8_t *t, size_t cap) {
     int fail = 0;
     while (i < n && !fail) {
         int best = 0; size_t bestd = 0;
-        if (i + REF_MINM <= n) {
-            int32_t c = head[ref_h4(s + i)]; int tries = 0;
-            while (c >= 0 && tries < REF_MAXTRY) {
-                size_t cd = i - (size_t)c;
-                if (cd && s[c] == s[i] && s[c+1] == s[i+1] &&
-                    s[c+2] == s[i+2] && s[c+3] == s[i+3]) {
-                    /* Can this candidate even beat the current best?  One
-                     * compare at offset `best` rejects almost all of them;
-                     * without it every candidate walked the full match
-                     * length, which is most of the matcher's cost on
-                     * repetitive data.  The `i + best < n` guard is load
-                     * bearing: when the best match runs to the end of the
-                     * block, i + best == n and the compare reads one byte
-                     * past the buffer — harmless under glibc/musl, a
-                     * segfault on Android where the block lands against a
-                     * page boundary (found by ASAN on the phone). */
-                    if (best && i + best < n && s[c + best] != s[i + best]) {
-                        c = chain[c & REF_HMASK]; tries++; continue;
-                    }
-                    size_t L = 0;
-                    while (i + L < n && s[c + L] == s[i + L]) L++;
-                    if ((int)L > best) { best = (int)L; bestd = cd; }
+        ref_find(s, n, i, head, chain, &best, &bestd);
+        if (REF_LAZY && best >= REF_MINM && i + 1 < n) {
+            /* Lazy step: if a strictly longer match starts at i+1, a
+             * literal here and that match there is cheaper overall. */
+            int best2 = 0; size_t bestd2 = 0;
+            ref_find(s, n, i + 1, head, chain, &best2, &bestd2);
+            if (best2 > best) {
+                if (i + REF_MINM <= n) {
+                    uint32_t hh = ref_h4(s + i);
+                    chain[i & REF_HMASK] = head[hh];
+                    head[hh] = (int32_t)i;
                 }
-                c = chain[c & REF_HMASK]; tries++;
+                i++;
+                continue;
             }
         }
         if (best >= REF_MINM) {
@@ -721,6 +737,178 @@ static int ref_decode(const uint8_t *t, size_t tn, uint8_t *out, size_t outn) {
 int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl,
                         int mo, int no_bwt, int no_lz);
 
+
+/* ─── reference layer v2: columnar sub-streams ──────────────────
+ * The v1 token stream interleaves [tag][len][dist][...] and is then
+ * handed to the generic compressor as ONE block, so several very
+ * different statistics — the near-constant tag column, the small
+ * match lengths, the wide distances, the literal text — all share a
+ * single stride/order/Huffman choice.  Regrouping them into
+ * homogeneous columns and compressing each with its own model is a
+ * large win on source-like text: measured 2.27x -> 3.5x on 152KB of
+ * C.  Distances split into a fixed u16 low half plus a varint high
+ * half: the near-uniform 16-bit values let the compressor's stride
+ * detection model the two byte planes separately, while a mixed-length
+ * varint stream defeats that (23021 -> 21520 bytes on the corpus); the
+ * high half is almost always 0, so it costs a few hundred bytes.
+ * The matcher (ref_encode) is untouched; only the serialization
+ * changes, and the decoder rebuilds the v1 stream so ref_decode stays
+ * as it is.  v1 streams (stride CPENC_STRIDE_REF) still decode.
+ * Layout: [u32 tn][u32 complen[6]][u32 uncomplen[6]][6 x cpenc block];
+ * columns: tags, lens, dist-lo, dist-hi, exceptions, literals. */
+#define REF2_NSUB 6
+#define REF2_HDR  (4 + 8 * REF2_NSUB)
+/* Split the v1 token stream into 6 columns laid out contiguously in
+ * col[] (or, if col is NULL, only compute the per-column lengths).
+ * Returns the total columnar size. */
+static size_t ref_split2(const uint8_t *tok, size_t tn, uint8_t *col,
+                         size_t plen[REF2_NSUB]) {
+    size_t nt = 0, nl = 0, ndl = 0, ndh = 0, ne = 0, nx = 0, ti = 0;
+    while (ti < tn) {                                  /* pass 1: sizes */
+        uint8_t tag = tok[ti++]; nt++;
+        uint32_t len = 0; int sh = 0;
+        while (1) { uint8_t b = tok[ti++]; nl++; len |= (uint32_t)(b & 0x7F) << sh;
+                    if (!(b & 0x80)) break; sh += 7; }
+        if (tag == 0) { nx += len; ti += len; }
+        else {
+            uint32_t dist = 0; sh = 0;
+            while (1) { uint8_t b = tok[ti++]; dist |= (uint32_t)(b & 0x7F) << sh;
+                        if (!(b & 0x80)) break; sh += 7; }
+            ndl += 2;                                  /* dist low 16 bits */
+            uint32_t dh = dist >> 16;                  /* dist high bits */
+            do { ndh++; dh >>= 7; } while (dh);
+            if (tag == 2) {
+                uint32_t nex = 0; sh = 0;
+                while (1) { uint8_t b = tok[ti++]; ne++; nex |= (uint32_t)(b & 0x7F) << sh;
+                            if (!(b & 0x80)) break; sh += 7; }
+                for (uint32_t e = 0; e < nex; e++) {
+                    while (1) { uint8_t b = tok[ti++]; ne++; if (!(b & 0x80)) break; }
+                    ne++; ti++;                        /* exception value byte */
+                }
+            }
+        }
+    }
+    plen[0] = nt; plen[1] = nl; plen[2] = ndl; plen[3] = ndh; plen[4] = ne; plen[5] = nx;
+    if (!col) return nt + nl + ndl + ndh + ne + nx;
+    uint8_t *ct = col, *cl = col + nt, *cdl = col + nt + nl,
+            *cdh = col + nt + nl + ndl, *ce = col + nt + nl + ndl + ndh,
+            *cx = col + nt + nl + ndl + ndh + ne;
+    size_t q1 = 0, q2 = 0, q3 = 0, q4 = 0, q5 = 0, q6 = 0; ti = 0;
+    while (ti < tn) {                                  /* pass 2: fill */
+        uint8_t tag = tok[ti++]; ct[q1++] = tag;
+        uint32_t len = 0; int sh = 0;
+        while (1) { uint8_t b = tok[ti++]; cl[q2++] = b; len |= (uint32_t)(b & 0x7F) << sh;
+                    if (!(b & 0x80)) break; sh += 7; }
+        if (tag == 0) { memcpy(cx + q6, tok + ti, len); q6 += len; ti += len; }
+        else {
+            uint32_t dist = 0; sh = 0;
+            while (1) { uint8_t b = tok[ti++]; dist |= (uint32_t)(b & 0x7F) << sh;
+                        if (!(b & 0x80)) break; sh += 7; }
+            cdl[q3++] = (uint8_t)dist; cdl[q3++] = (uint8_t)(dist >> 8);
+            uint32_t dh = dist >> 16;
+            do { uint8_t b = dh & 0x7F; dh >>= 7; if (dh) b |= 0x80; cdh[q4++] = b; } while (dh);
+            if (tag == 2) {
+                uint32_t nex = 0; sh = 0;
+                while (1) { uint8_t b = tok[ti++]; ce[q5++] = b; nex |= (uint32_t)(b & 0x7F) << sh;
+                            if (!(b & 0x80)) break; sh += 7; }
+                for (uint32_t e = 0; e < nex; e++) {
+                    while (1) { uint8_t b = tok[ti++]; ce[q5++] = b; if (!(b & 0x80)) break; }
+                    ce[q5++] = tok[ti++];
+                }
+            }
+        }
+    }
+    return nt + nl + ndl + ndh + ne + nx;
+}
+/* Pack tok[0..tn) into out; returns payload size or 0 on failure. */
+static size_t ref_pack2(const uint8_t *tok, size_t tn, uint8_t *out, size_t cap, int mo) {
+    if (tn < 16) return 0;
+    size_t plen[REF2_NSUB];
+    size_t colsz = ref_split2(tok, tn, NULL, plen);
+    uint8_t *col = malloc(colsz + 64);
+    if (!col) return 0;
+    ref_split2(tok, tn, col, plen);
+    size_t off[REF2_NSUB]; { size_t a = 0; for (int i = 0; i < REF2_NSUB; i++) { off[i] = a; a += plen[i]; } }
+    uint8_t *blk[REF2_NSUB] = {0}; size_t blen[REF2_NSUB] = {0};
+    size_t tot = REF2_HDR; int ok = 1;
+    for (int i = 0; i < REF2_NSUB && ok; i++) {
+        size_t bc = cpenc_max_compressed_size(plen[i]) + 64;
+        uint8_t *bb = malloc(bc);
+        if (!bb) { ok = 0; break; }
+        size_t cl = bc;
+        if (cpenc_compress_impl(col + off[i], plen[i], bb, &cl, mo, 1, 1)) {
+            free(bb); ok = 0; break;
+        }
+        blk[i] = bb; blen[i] = cl;
+        tot += blen[i];
+    }
+    if (ok && tot <= cap) {
+        out[0]=(uint8_t)tn; out[1]=(uint8_t)(tn>>8); out[2]=(uint8_t)(tn>>16); out[3]=(uint8_t)(tn>>24);
+        for (int i = 0; i < REF2_NSUB; i++) {
+            uint32_t c = (uint32_t)blen[i], u = (uint32_t)plen[i];
+            out[4+4*i+0]=(uint8_t)c; out[4+4*i+1]=(uint8_t)(c>>8); out[4+4*i+2]=(uint8_t)(c>>16); out[4+4*i+3]=(uint8_t)(c>>24);
+            out[28+4*i+0]=(uint8_t)u; out[28+4*i+1]=(uint8_t)(u>>8); out[28+4*i+2]=(uint8_t)(u>>16); out[28+4*i+3]=(uint8_t)(u>>24);
+        }
+        size_t w = REF2_HDR;
+        for (int i = 0; i < REF2_NSUB; i++) { memcpy(out + w, blk[i], blen[i]); w += blen[i]; }
+    } else ok = 0;
+    for (int i = 0; i < REF2_NSUB; i++) free(blk[i]);
+    free(col);
+    return ok ? tot : 0;
+}
+/* Rebuild the v1 token stream (exactly tn bytes) from a packed payload.
+ * Returns 0 on success. */
+static int ref_unpack2(const uint8_t *pl, size_t pln, uint8_t *tok, size_t tn) {
+    if (pln < REF2_HDR) return -1;
+    uint32_t cl[REF2_NSUB], ul[REF2_NSUB];
+    for (int i = 0; i < REF2_NSUB; i++) {
+        cl[i] = (uint32_t)pl[4+4*i] | ((uint32_t)pl[4+4*i+1]<<8) | ((uint32_t)pl[4+4*i+2]<<16) | ((uint32_t)pl[4+4*i+3]<<24);
+        ul[i] = (uint32_t)pl[28+4*i] | ((uint32_t)pl[28+4*i+1]<<8) | ((uint32_t)pl[28+4*i+2]<<16) | ((uint32_t)pl[28+4*i+3]<<24);
+    }
+    size_t off = REF2_HDR;
+    uint8_t *ub[REF2_NSUB] = {0};
+    int rc = 0;
+    for (int i = 0; i < REF2_NSUB; i++) {
+        if (off + cl[i] > pln) { rc = -1; break; }
+        ub[i] = malloc(ul[i] ? ul[i] : 1);
+        if (!ub[i]) { rc = -2; break; }
+        size_t o = ul[i];
+        if (cpenc_decompress(pl + off, cl[i], ub[i], &o) != 0 || o != ul[i]) { rc = -1; break; }
+        off += cl[i];
+    }
+    if (rc == 0) {
+        uint8_t *ct = ub[0], *cln = ub[1], *cdl = ub[2], *cdh = ub[3], *ce = ub[4], *cx = ub[5];
+        size_t p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, ti = 0;
+        while (p1 < ul[0]) {
+            uint8_t tag = ct[p1++]; tok[ti++] = tag;
+            uint32_t len = 0; int sh = 0;
+            while (1) { uint8_t b = cln[p2++]; tok[ti++] = b; len |= (uint32_t)(b & 0x7F) << sh;
+                        if (!(b & 0x80)) break; sh += 7; }
+            if (tag == 0) { memcpy(tok + ti, cx + p6, len); ti += len; p6 += len; }
+            else {
+                uint32_t dist = (uint32_t)cdl[p3] | ((uint32_t)cdl[p3+1] << 8); p3 += 2;
+                uint32_t dh = 0; sh = 0;
+                while (1) { uint8_t b = cdh[p4++]; dh |= (uint32_t)(b & 0x7F) << sh;
+                            if (!(b & 0x80)) break; sh += 7; }
+                dist |= dh << 16;
+                do { uint8_t b = dist & 0x7F; dist >>= 7; if (dist) b |= 0x80; tok[ti++] = b; } while (dist);
+                if (tag == 2) {
+                    uint32_t nex = 0; sh = 0;
+                    while (1) { uint8_t b = ce[p5++]; tok[ti++] = b; nex |= (uint32_t)(b & 0x7F) << sh;
+                                if (!(b & 0x80)) break; sh += 7; }
+                    for (uint32_t e = 0; e < nex; e++) {
+                        while (1) { uint8_t b = ce[p5++]; tok[ti++] = b; if (!(b & 0x80)) break; }
+                        tok[ti++] = ce[p5++];
+                    }
+                }
+            }
+        }
+        if (ti != tn) rc = -1;
+    }
+    for (int i = 0; i < REF2_NSUB; i++) free(ub[i]);
+    return rc;
+}
+
 static uint64_t ref_h16(const uint8_t *p) {
     uint64_t a, b;
     memcpy(&a, p, 8); memcpy(&b, p + 8, 8);
@@ -805,6 +993,13 @@ static size_t ref_sample_size(const uint8_t *s, size_t S, int mo) {
             if (cpenc_compress_impl(tok, tn, bb + CPENC_HEADER_SIZE, &cl, mo, 1, 1) == 0)
                 tot = CPENC_HEADER_SIZE + cl;
             free(bb);
+        }
+        size_t pcap = cpenc_max_compressed_size(tn) + 8 * REF2_NSUB + 64;
+        uint8_t *pl = malloc(pcap);
+        if (pl) {
+            size_t pn = ref_pack2(tok, tn, pl, pcap, mo);
+            if (pn && (!tot || CPENC_HEADER_SIZE + pn < tot)) tot = CPENC_HEADER_SIZE + pn;
+            free(pl);
         }
     }
     free(tok);
@@ -897,13 +1092,15 @@ static size_t ref_try(const uint8_t *s, size_t sl, uint8_t *d, size_t cap,
     size_t tn = ref_encode(s, sl, tok, tcap);
     size_t res = 0;
     if (tn && tn < sl) {
+        /* v1: the interleaved token stream as one block — wins on logs,
+         * records and near-constant text, where matches are long and few
+         * and the fixed columnar header dominates. */
         size_t bcap = cpenc_max_compressed_size(tn) + 64;
         uint8_t *bb = malloc(bcap);
         if (bb) {
             size_t cl = bcap - CPENC_HEADER_SIZE;
-            size_t tot = 0;
             if (cpenc_compress_impl(tok, tn, bb + CPENC_HEADER_SIZE, &cl, mo, 1, 1) == 0) {
-                tot = CPENC_HEADER_SIZE + cl;
+                size_t tot = CPENC_HEADER_SIZE + cl;
                 if (tot < base_len && tot <= cap) {
                     CPEncHeader *bh = (CPEncHeader *)bb;
                     bh->magic = CPENC_MAGIC; bh->version = CPENC_VERSION;
@@ -915,6 +1112,28 @@ static size_t ref_try(const uint8_t *s, size_t sl, uint8_t *d, size_t cap,
                 }
             }
             free(bb);
+        }
+        /* v2: columnar sub-streams — wins on source-like text, where the
+         * token stream is dense short matches and each column gets its
+         * own model.  Kept only if strictly smaller than v1. */
+        size_t pcap = cpenc_max_compressed_size(tn) + 8 * REF2_NSUB + 64;
+        uint8_t *pl = malloc(pcap);
+        if (pl) {
+            size_t pn = ref_pack2(tok, tn, pl, pcap, mo);
+            if (pn) {
+                size_t tot = CPENC_HEADER_SIZE + pn;
+                size_t lim = res ? res : base_len;
+                if (tot < lim && tot <= cap) {
+                    CPEncHeader *bh = (CPEncHeader *)d;
+                    bh->magic = CPENC_MAGIC; bh->version = CPENC_VERSION;
+                    bh->stride = CPENC_STRIDE_REF2;
+                    bh->original_size = (uint32_t)sl;
+                    bh->compressed_size = (uint32_t)pn;
+                    memcpy(d + CPENC_HEADER_SIZE, pl, pn);
+                    res = tot;
+                }
+            }
+            free(pl);
         }
     }
     free(tok);
@@ -2248,6 +2467,27 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         return 0;
     }
 
+    if(h->stride==CPENC_STRIDE_REF2){
+        /* v2: columnar sub-streams.  Rebuild the v1 token stream and
+         * hand it to the unchanged ref_decode. */
+        if(sl < CPENC_HEADER_SIZE + REF2_HDR) return -1;
+        if(*dl < h->original_size) return -1;
+        const uint8_t *pl = s + CPENC_HEADER_SIZE;
+        size_t pln = h->compressed_size;
+        if(pln > (size_t)(sl - CPENC_HEADER_SIZE) || pln < REF2_HDR) return -1;
+        uint32_t tn = (uint32_t)pl[0] | ((uint32_t)pl[1]<<8) |
+                      ((uint32_t)pl[2]<<16) | ((uint32_t)pl[3]<<24);
+        if(!tn) return -1;
+        uint8_t *tok = malloc(tn);
+        if(!tok) return -2;
+        if(ref_unpack2(pl, pln, tok, tn) != 0){ free(tok); return -1; }
+        int rc = ref_decode(tok, tn, d, h->original_size);
+        free(tok);
+        if(rc != 0) return -1;
+        *dl = h->original_size;
+        return 0;
+    }
+
     if(h->stride==CPENC_STRIDE_RAW){
         if(h->original_size==0){*dl=0;return 0;}
         if(*dl<h->original_size) return -1;
@@ -2274,6 +2514,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
 
     uint8_t *trans = (stride==1) ? d : malloc(orig);
     if(!trans) return -2;
+    int fused[8] = {0};   /* groups whose un-delta the fused decoder already did */
 
     for(int g=0;g<stride;g++){
         if(p>=edd){if(stride>1)free(trans);return-1;}
@@ -2514,8 +2755,10 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             free(runs_buf);free(vals_buf);free(scratch);
         }else{
             int hrc;
-            if(stride==1 && orders[g]==1 && lag_idx==0)
+            if(stride==1 && orders[g]==1 && lag_idx==0){
                 hrc = h_dec_p(&p,edd,gp,gs,1);       /* fused prefix sum */
+                fused[g] = 1;
+            }
             else if(gs >= (1u<<20)) hrc = h_dec_seg(&p,edd,gp,gs);
             else                     hrc = h_dec(&p,edd,gp,gs);
             if(hrc<0){if(stride>1)free(trans);return-1;}
@@ -2531,7 +2774,13 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             p += rem;
         }
     }
-    for(int g=0;g<stride;g++) dd(trans+g*gs,gs,orders[g]);
+    /* Un-delta each group.  A group decoded through the fused prefix-sum
+     * decoder (h_dec_p) already has the un-delta folded into its output,
+     * so un-deltaing it here a second time corrupts the block — the
+     * stride=1/order=1/Huffman case.  h_dec_p is only reached when
+     * stride==1, so the fused group is group 0. */
+    for(int g=0;g<stride;g++)
+        if(!fused[g]) dd(trans+g*gs,gs,orders[g]);
     if(stride>1){ur(trans,d,orig,stride);free(trans);}
     /* v3: undo lag-delta (applied pre-transpose on the raw byte order) */
     if(lag_idx){

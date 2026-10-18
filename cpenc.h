@@ -20,6 +20,9 @@ extern "C" {
 #define CPENC_STRIDE_SEG 0xFD  /* segmented: per-segment lag+stride */
 #define CPENC_STRIDE_BWT 0xFC  /* BWT: reorder then lag/stride (archive-mode) */
 #define CPENC_STRIDE_REF 0xFB  /* reference layer: repeats as (distance,len) + patches */
+#define CPENC_STRIDE_REF2 0xFA /* reference layer v2: the token stream split
+                                 * into columnar sub-streams, one compressor
+                                 * model each (source-code win) */
 /* Reference layer: run it when this fraction of spread 16-byte windows
  * repeat, even if the head sample looked unmatchable. */
 #define REF_DUP_MIN 0.10
