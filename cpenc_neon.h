@@ -82,7 +82,59 @@ static inline void ne_freq_count(const uint8_t *restrict p, size_t n,
     for (; i < n; i++) fq[p[i]]++;
 }
 
-/* ── NEON LUT record: count unique values from freq table ───────
-   Trivial since it only scans 256 entries. ──────────────────── */
+/* ── NEON LUT decode (tag 1 and the RLE sub-blocks) ───────────────
+   The LUT path bit-unpacks nbits-wide indices from a packed stream and
+   looks each one up in a byte table.  The scalar loop is a serial chain
+   through a 64-bit shift buffer: ~6 dependent ops per symbol.  Because
+   16 symbols always consume exactly 16*nbits bits = 2*nbits whole bytes,
+   every 16-symbol batch starts byte-aligned, which makes the batch
+   vectorisable without a carry.
+
+   ne_lut16 decodes one batch of 16 indices from s (byte-aligned) and
+   looks them up in a 64-byte padded table t (entries [nz,64) hold
+   lut[0]).  Requires nbits <= 8 and nz <= 64; the caller falls back to
+   the scalar loop otherwise.  Reads s[0..16] (17 bytes).
+
+   Bit extraction: for index k the field spans bytes (k*nbits)>>3 and
+   +1, so a single vqtbl1q gathers both bytes for all 16 lanes, a 16-bit
+   or/shift assembles the field, and a mask isolates it.  The lookup is
+   one vqtbl4q_u8 over the padded table (out-of-range index -> 0, which
+   the caller's padding turns into lut[0]). ─────────────────────── */
+
+static inline uint8x16_t ne_lut16(const uint8_t *restrict s, int nbits,
+                                  const uint8_t *restrict t64) {
+    uint8_t bi[16], sh[16];
+    for (int k = 0; k < 16; k++) {
+        int b = k * nbits;
+        bi[k] = (uint8_t)(b >> 3);
+        sh[k] = (uint8_t)(b & 7);
+    }
+    uint8x16_t tab = vld1q_u8(s);
+    uint8_t s16 = s[16];
+    uint8x16_t bi0 = vld1q_u8(bi);
+    uint8x16_t bi1 = vaddq_u8(bi0, vdupq_n_u8(1));
+    uint8x16_t b0 = vqtbl1q_u8(tab, bi0);
+    uint8x16_t b1 = vqtbl1q_u8(tab, bi1);
+    /* lane 15's high byte can be byte 16, which vqtbl1q returns as 0 */
+    b1 = vbslq_u8(vceqq_u8(bi1, vdupq_n_u8(16)), vdupq_n_u8(s16), b1);
+
+    uint16x8_t w0 = vorrq_u16(vmovl_u8(vget_low_u8(b0)),
+                              vshll_n_u8(vget_low_u8(b1), 8));
+    uint16x8_t w1 = vorrq_u16(vmovl_u8(vget_high_u8(b0)),
+                              vshll_n_u8(vget_high_u8(b1), 8));
+    uint16x8_t shlo = vmovl_u8(vget_low_u8(vld1q_u8(sh)));
+    uint16x8_t shhi = vmovl_u8(vget_high_u8(vld1q_u8(sh)));
+    w0 = vshlq_u16(w0, vreinterpretq_s16_u16(vsubq_u16(vdupq_n_u16(0), shlo)));
+    w1 = vshlq_u16(w1, vreinterpretq_s16_u16(vsubq_u16(vdupq_n_u16(0), shhi)));
+    uint16x8_t m = vdupq_n_u16((uint16_t)((1u << nbits) - 1));
+    uint8x16_t idx = vcombine_u8(vmovn_u16(vandq_u16(w0, m)),
+                                 vmovn_u16(vandq_u16(w1, m)));
+    /* index >= 64 is invalid (nz<=64); map to 0 so padding yields lut[0] */
+    uint8x16_t idxc = vbslq_u8(vcltq_u8(idx, vdupq_n_u8(64)), idx,
+                               vdupq_n_u8(0));
+    uint8x16x4_t tt = { vld1q_u8(t64), vld1q_u8(t64 + 16),
+                        vld1q_u8(t64 + 32), vld1q_u8(t64 + 48) };
+    return vqtbl4q_u8(tt, idxc);
+}
 
 #endif /* CPENC_NEON_H */

@@ -7,6 +7,10 @@
 #include <math.h>
 #include <stdio.h>
 
+#if defined(__aarch64__)
+#include "cpenc_neon.h"
+#endif
+
 #define HUFF_MAX 12
 #define HUFF_WSZ (1<<HUFF_MAX)
 #define HUFF_TABSZ (HUFF_WSZ * 2)
@@ -2546,6 +2550,20 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 uint32_t mask = (uint32_t)((1 << nbits) - 1);
                 uint64_t rbuf = 0; int rbc = 0;
                 size_t i = 0;
+#if defined(__aarch64__)
+                /* NEON: 16 symbols per batch (16*nbits bits = 2*nbits whole
+                 * bytes, so every batch starts byte-aligned).  Covers
+                 * nz<=64, which is every LUT group in the reference set. */
+                if (nz <= 64) {
+                    uint8_t t64[64];
+                    for (int k = 0; k < nz; k++) t64[k] = lut[k];
+                    for (int k = nz; k < 64; k++) t64[k] = lut[0];
+                    for (; i + 16 <= gs && (size_t)(edd - p) >= 17; i += 16) {
+                        vst1q_u8(gp + i, ne_lut16(p, nbits, t64));
+                        p += 2 * nbits;
+                    }
+                }
+#endif
                 /* Process 4 bytes (32 bits) at a time where possible */
                 for (; i + 4 <= gs; i += 4) {
                     /* Fill exactly the 4 symbols' worth of bits: the old
@@ -2660,7 +2678,20 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 if(tgs>gs/2+1){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 int nbits=1;while((1<<nbits)<nz&&nbits<12)nbits++;
                 uint64_t rbuf=0;int rbc=0;
-                for(size_t i=0;i<tgs;i++){
+                size_t i=0;
+#if defined(__aarch64__)
+                if (nbits <= 8 && nz <= 64) {
+                    uint8_t t64[64], tmp[16];
+                    for (int k = 0; k < nz; k++) t64[k] = lut[k];
+                    for (int k = nz; k < 64; k++) t64[k] = lut[0];
+                    for (; i + 16 <= tgs && (size_t)(edd - p) >= 17; i += 16) {
+                        vst1q_u8(tmp, ne_lut16(p, nbits, t64));
+                        for (int j = 0; j < 16; j++) runs_buf[nr++] = (uint32_t)tmp[j];
+                        p += 2 * nbits;
+                    }
+                }
+#endif
+                for(;i<tgs;i++){
                     while(rbc<nbits&&p<edd){rbuf|=(uint64_t)(*p++)<<rbc;rbc+=8;}
                     uint8_t idx=rbuf&((1<<nbits)-1);rbuf>>=nbits;rbc-=nbits;
                     runs_buf[nr++]=(uint32_t)(idx<nz?lut[idx]:lut[0]);
@@ -2702,7 +2733,20 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 if(tgs>gs){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 int nbits=1;while((1<<nbits)<nz&&nbits<12)nbits++;
                 uint64_t rbuf=0;int rbc=0;
-                for(size_t i=0;i<tgs;i++){
+                size_t i=0;
+#if defined(__aarch64__)
+                if (nbits <= 8 && nz <= 64) {
+                    uint8_t t64[64];
+                    for (int k = 0; k < nz; k++) t64[k] = lut[k];
+                    for (int k = nz; k < 64; k++) t64[k] = lut[0];
+                    for (; i + 16 <= tgs && (size_t)(edd - p) >= 17; i += 16) {
+                        vst1q_u8(vals_buf + nv, ne_lut16(p, nbits, t64));
+                        nv += 16;
+                        p += 2 * nbits;
+                    }
+                }
+#endif
+                for(;i<tgs;i++){
                     while(rbc<nbits&&p<edd){rbuf|=(uint64_t)(*p++)<<rbc;rbc+=8;}
                     uint8_t idx=rbuf&((1<<nbits)-1);rbuf>>=nbits;rbc-=nbits;
                     vals_buf[nv++]=(uint8_t)(idx<nz?lut[idx]:lut[0]);
