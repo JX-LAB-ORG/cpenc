@@ -58,6 +58,15 @@ static void gbp(uint8_t*b,size_t n){uint64_t s=88172645463325252ULL;
         if((r>>8)%100<1)v=(uint8_t)(v&~0x40u);
         if((r>>16)%200<1)v=(uint8_t)(v|0x80u);
         b[i]=v;}}
+/* Fused Huffman+prefix-sum decode path: stride 1, delta order 1, no lag,
+ * Huffman tag.  The fused decoder applies the un-delta itself, so the
+ * caller must not un-delta again — that double pass corrupted exactly
+ * this combination (A/B verified: 87b3dc3 fails, the fix passes). */
+static void gou(uint8_t*b,size_t n){uint64_t s=0x9E3779B97F4A7C15ULL; double x=0;
+    for(size_t i=0;i<n;i++){s^=s<<13;s^=s>>7;s^=s<<17;
+        double u=(double)(s>>40)/16777216.0;
+        x=0.9*x+(u-0.5)*12.0;
+        b[i]=(uint8_t)(int)(128.0+x);}}
 /* Mixed block: a compressible half then a random half.  In one block
  * every group straddles both halves, so no tag can price it — this fell
  * to RAW at 1.00x until the spread test started segmenting such blocks. */
@@ -81,7 +90,7 @@ int main(void){
         {"LINEAR_16K",gl,4},{"REFREP_16K",gref1,2},{"REFREC_16K",gref2,2},
         {"REFMIX_16K",gref3,2},{"REFREC1K_16K",gref4,2},
         {"REFREC4K_16K",gref5,2},{"BITPLANE_16K",gbp,2},
-        {"BITPLANE_64K",gbp,2},{"MIXED_256K",gmix,2},{0,0,0}};
+        {"BITPLANE_64K",gbp,2},{"MIXED_256K",gmix,2},{"HUF_DELTA_64K",gou,2},{0,0,0}};
     for(int i=0;ts[i].nm;i++){
         size_t sz=strstr(ts[i].nm,"256K")?262144:strstr(ts[i].nm,"64K")?65536:strstr(ts[i].nm,"16K")?16384:4096;
         ts[i].fn(b,sz); rt(ts[i].nm,b,sz,ts[i].mo);
