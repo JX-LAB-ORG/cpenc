@@ -1,6 +1,9 @@
 /* cpenc_neon.h — ARM NEON accelerated inner loops for cpenc */
+#ifndef CPENC_NEON_H
+#define CPENC_NEON_H
 
 #include <arm_neon.h>
+#include <string.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -13,25 +16,18 @@
 
 static inline void ne_delta1(uint8_t *restrict p, size_t n) {
     if (n < 2) return;
-    /* First byte stays unchanged; delta only applies from byte 1. */
-    uint8_t carry = p[0]; /* previous byte before position 1 */
-    size_t i = 1;
-
-    /* Process 16 bytes at a time */
-    for (; i + 16 <= n; i += 16) {
-        uint8x16_t v  = vld1q_u8(p + i);           /*  0  1  2 ... 15 */
-        /* Build vector with carry at element 0 and v[0..14] at 1..15 */
-        uint8x16_t s  = vld1q_u8(p + i - 1);       /* -1  0  1 ... 14 */
-        v = vsubq_u8(v, s);                         /* subtract */
-        vst1q_u8(p + i, v);
+    /* Must run BACKWARDS: the difference reads p[k-1], which the scalar
+     * version assumes is still original.  A forward pass clobbers it and
+     * the block after the first one subtracts an already-differenced
+     * byte (this is why the file was never wired in). */
+    size_t i = n;
+    while (i >= 17) {
+        i -= 16;
+        uint8x16_t v = vld1q_u8(p + i);
+        uint8x16_t s = vld1q_u8(p + i - 1);
+        vst1q_u8(p + i, vsubq_u8(v, s));
     }
-    /* Tail: scalar for remaining bytes */
-    for (; i < n; i++) {
-        uint8_t t = p[i];
-        p[i] -= p[i-1];
-        carry = t;
-    }
-    (void)carry;
+    for (size_t k = i; k-- > 1; ) p[k] -= p[k-1];
 }
 
 /* ── NEON undelta(1): p[i] += p[i-1] ────────────────────────────
