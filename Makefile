@@ -1,6 +1,14 @@
 .PHONY: test clean all
 
-CFLAGS = -std=c11 -Wall -O3 -march=armv8-a+simd -I.
+# Target-specific ISA flags: NEON on aarch64, a conservative x86-64 baseline
+# elsewhere (the NEON paths are compiled out there).  Override with ARCHFLAGS=.
+ARCH := $(shell uname -m)
+ifeq ($(ARCH),aarch64)
+ARCHFLAGS ?= -march=armv8-a+simd
+else
+ARCHFLAGS ?= -march=x86-64-v2
+endif
+CFLAGS = -std=c11 -D_GNU_SOURCE -fPIC -Wall -O3 $(ARCHFLAGS) -I.
 
 all: cpenc.o bwt.o cpool.o libcpool_hook.o
 
