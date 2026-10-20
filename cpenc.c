@@ -1971,7 +1971,11 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
              * Threshold lowered to 50% so BWT+MTF streams (0 ~57-70%, long
              * runs) qualify; run count is scanned (cheap, only for zero-heavy
              * groups) because the alternating-stream bound 2nv+1 overestimates
-             * clustered zeros by ~5x and would steer them to Huffman. */
+             * clustered zeros by ~5x and would steer them to Huffman.
+             * The decoder sizes its run buffer from this same threshold
+             * (rle_max_run_bytes): the encoded run stream is a byte stream
+             * with 255+LEB128 escapes, so it is longer than the run count.
+             * Loosening gs/2 here means loosening that bound too. */
             if(fq[0] > (uint32_t)gs/2 && gs >= 64){
                 uint32_t *runs; uint8_t *vls, *r8; size_t nv, nr8, sz_rle;
                 int st_r, st_v;
@@ -2294,6 +2298,29 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
 
     h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(out-(d+CPENC_HEADER_SIZE));
     *dl=(size_t)(out-d); free(trial); free(trans); free(hexbuf); return 0;
+}
+
+/* Upper bound on the ENCODED run stream of a tag-4 (RLE) group — which is
+ * not the run count.  rle_build() writes a run of 255 or more as the byte 255
+ * followed by a LEB128 remainder, so one run can occupy several bytes; the
+ * decoder walks those bytes, so what it has to size its buffer for is the
+ * byte count, not the number of runs.
+ *
+ * The run count itself is bounded by the encoder's zero-density gate
+ * (fq[0] > gs/2, in the RLE candidate of cpenc_compress_impl).  Runs and
+ * values strictly alternate, so with z zero-blocks, b non-zero blocks and nv
+ * non-zero bytes the run count is z + (nv-b) + [gp[0]!=0]; a group starting
+ * with a zero block has z <= b+1 and one starting with a non-zero has z <= b,
+ * so either way nr <= nv+1.  The gate caps nv at ceil(gs/2)-1.
+ * Each run of 255 or more then adds at most 5 continuation bytes and eats at
+ * least 255 zeros, so at most gs/255 of them exist.
+ *
+ * Both halves come from that one gate: if it is ever loosened, this bound
+ * has to be loosened with it.  (It was loosened once — to gs/8 — and the
+ * encoder's own runs[] buffer is what overflowed; see the note in
+ * rle_build.)  The bound is a corrupt-input guard, so erring large is safe. */
+static size_t rle_max_run_bytes(size_t gs) {
+    return gs/2 + 2 + 5*(gs/255) + 8;
 }
 
 int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
@@ -2679,7 +2706,8 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             /* RLE: decode runs and vals sub-blocks, alternate fill */
             if(p>=edd){if(stride>1)free(trans);return-1;}
             uint8_t st=*p++;
-            uint32_t *runs_buf = malloc((gs/2+2)*sizeof(uint32_t));
+            size_t rb_cap = rle_max_run_bytes(gs);   /* encoded run bytes */
+            uint32_t *runs_buf = malloc(rb_cap*sizeof(uint32_t));
             uint8_t *vals_buf = malloc(gs);
             uint8_t *scratch = malloc(gs);
             if(!runs_buf||!vals_buf||!scratch){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
@@ -2688,14 +2716,14 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
                 uint8_t val=*p++;p++;
-                if(tgs>gs/2+1){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(tgs>rb_cap){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<tgs;k++)runs_buf[nr++]=(uint32_t)val;
             }else if(st==1){
                 if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
                 uint8_t nz1=*p++;int nz=nz1+1;
                 uint8_t lut[256];for(int i=0;i<nz;i++){if(p>=edd){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}lut[i]=*p++;}
-                if(tgs>gs/2+1){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(tgs>rb_cap){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 int nbits=1;while((1<<nbits)<nz&&nbits<12)nbits++;
                 uint64_t rbuf=0;int rbc=0;
                 size_t i=0;
@@ -2720,18 +2748,18 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 /* huffman sub-block: symbol count lives in the stream header */
                 if((size_t)(edd-p)<264){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t rn=(uint32_t)p[256]|((uint32_t)p[257]<<8)|((uint32_t)p[258]<<16)|((uint32_t)p[259]<<24);
-                if(rn>gs/2+2){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(rn>rb_cap){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 if(h_dec(&p,edd,scratch,rn)<0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<rn;k++)runs_buf[nr++]=(uint32_t)scratch[k];
             }else if(st==3){
                 if((size_t)(edd-p)<4){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t rl=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
-                if(rl>gs/2+1||(size_t)(edd-p)<rl){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(rl>rb_cap||(size_t)(edd-p)<rl){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<rl;k++)runs_buf[nr++]=(uint32_t)p[k];
                 p+=rl;
             }else if(st==4){
                 uint32_t tlen=0;
-                if(sub5_decode(&p,edd,scratch,gs/2+2,&tlen)!=0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(sub5_decode(&p,edd,scratch,rb_cap,&tlen)!=0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<tlen;k++)runs_buf[nr++]=(uint32_t)scratch[k];
             }
             /* vals sub-block */

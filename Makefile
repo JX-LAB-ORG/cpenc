@@ -36,6 +36,21 @@ test: cpenc.o cpool.o test/cpenc_test.c test/cpenc_roundtrip_test.c test/cpool_t
 	./test/cpool_test
 	cc $(CFLAGS) test/cpool_disk_test.c cpool.o cpenc.o bwt.o -lm -lpthread -o test/cpool_disk_test
 	./test/cpool_disk_test
+	cc $(CFLAGS) test/cpenc_rle_test.c cpenc.c bwt.o -lm -o test/cpenc_rle_test
+	./test/cpenc_rle_test
+
+# Codec benchmark: ratio + throughput over a real file, per stride.
+bench: test/bench_cpenc test/cpenc_verify test/cpenc_bisect
+test/bench_cpenc: test/bench_cpenc.c cpenc.o bwt.o
+	cc $(CFLAGS) test/bench_cpenc.c cpenc.o bwt.o -lm -o test/bench_cpenc
+
+# Round-trip sweep by block size; prints the failing offset and stride.
+test/cpenc_verify: test/cpenc_verify.c cpenc.o bwt.o
+	cc $(CFLAGS) test/cpenc_verify.c cpenc.o bwt.o -lm -o test/cpenc_verify
+
+# Shrink a failing block to the smallest length that still fails.
+test/cpenc_bisect: test/cpenc_bisect.c cpenc.o bwt.o
+	cc $(CFLAGS) test/cpenc_bisect.c cpenc.o bwt.o -lm -o test/cpenc_bisect
 
 clean:
-	rm -f *.o *.so test/cpenc_test test/cpool_test
+	rm -f *.o *.so test/cpenc_test test/cpool_test test/bench_cpenc test/cpenc_verify test/cpenc_bisect test/cpenc_rle_test
