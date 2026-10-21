@@ -16,6 +16,22 @@
 
 #define HUFF_MAX 12
 #define HUFF_WSZ (1<<HUFF_MAX)
+
+/* Hard ceiling on a block's decompressed size.  The format's field is a
+ * u32, but nothing in cpenc or cfs ever produces a block anywhere near this:
+ * cfs splits files at 64MB and the device layer uses 8MB.  Without a ceiling
+ * a 28-byte block claiming 1GB makes the decoder allocate and grind for
+ * seconds — fuzzing found that, and it is a denial-of-service knob that a
+ * container controls. */
+#define CPENC_MAX_BLOCK (256u << 20)
+
+/* How many bytes are left between a cursor and the end of its buffer.
+ * `(size_t)(end - p)` is the usual way to write this and it is wrong once p
+ * is already past end: the subtraction wraps, the comparison passes, and the
+ * "not enough bytes left" guard lets a read through.  Fuzzing found exactly
+ * that — h_dec was handed an end 256 bytes BEHIND its cursor and read into a
+ * guard page.  Every length check in the decoder uses this now. */
+#define REMAIN(p, end) ((p) > (end) ? (size_t)0 : (size_t)((end) - (p)))
 #define HUFF_TABSZ (HUFF_WSZ * 2)
 
 /* ── entropy from freq table ─────────────────────────────────
@@ -174,10 +190,19 @@ static void hlens(const uint32_t fq[256],uint8_t lens[256]){
     for (int i = 0; i < 256; i++) if (fq[i]) lens[i] = HUFF_MAX;
 }
 static void hcodes(const uint8_t lens[256],uint16_t code[256],uint8_t bits[256]){
-    int cnt[16]={0};for(int i=0;i<256;i++)if(lens[i])cnt[lens[i]]++;
+    /* On the decode side `lens` comes straight off the wire (h_dec_p copies
+     * 256 bytes of the stream into it), so it is untrusted: lengths above
+     * HUFF_MAX are not a code this decoder can build, and indexing cnt[] and
+     * next[], both 16 entries, with them walked off the stack.  Treat those
+     * symbols as absent instead — the decoder then fails to match them and
+     * returns -1, which is the answer a corrupt block deserves.  Encoder
+     * callers are unaffected: hlens() never emits more than HUFF_MAX. */
+    uint8_t l2[256];
+    for(int i=0;i<256;i++) l2[i] = (lens[i] <= HUFF_MAX) ? lens[i] : 0;
+    int cnt[16]={0};for(int i=0;i<256;i++)if(l2[i])cnt[l2[i]]++;
     uint32_t cur=0;uint16_t next[16];
     for(int L=1;L<=15;L++){next[L]=(uint16_t)cur;cur=(cur+(uint32_t)cnt[L])<<1;if(cur>65535)cur=65535;}
-    for(int i=0;i<256;i++){if(lens[i]){code[i]=next[lens[i]]++;bits[i]=lens[i];}else{code[i]=0;bits[i]=0;}}
+    for(int i=0;i<256;i++){if(l2[i]){code[i]=next[l2[i]]++;bits[i]=l2[i];}else{code[i]=0;bits[i]=0;}}
 }
 static uint32_t h_enc(const uint8_t *d,size_t n,const uint8_t lens[256],const uint16_t code[256],const uint8_t bits[256],uint8_t *ob,size_t cap){
     if(cap<264+n)return 0;
@@ -297,7 +322,7 @@ static int sub5_encode(uint8_t **po, const uint8_t *edd, const uint8_t *sym,
 static int sub5_decode(const uint8_t **pp, const uint8_t *edd, uint8_t *out,
                        size_t outcap, uint32_t *plen) {
     const uint8_t *p = *pp;
-    if ((size_t)(edd - p) < 9) return -1;
+    if (REMAIN(p,edd) < 9) return -1;
     uint32_t len = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); p += 4;
     if (len > outcap) return -1;
     uint8_t cval = *p++;
@@ -884,31 +909,48 @@ static int ref_unpack2(const uint8_t *pl, size_t pln, uint8_t *tok, size_t tn) {
     if (rc == 0) {
         uint8_t *ct = ub[0], *cln = ub[1], *cdl = ub[2], *cdh = ub[3], *ce = ub[4], *cx = ub[5];
         size_t p1 = 0, p2 = 0, p3 = 0, p4 = 0, p5 = 0, p6 = 0, ti = 0;
+        /* Every index below comes out of an untrusted stream: the columns are
+         * decoded blocks whose contents a corrupted container controls, and
+         * nothing here was checked.  One flipped bit in a REF2 block walked
+         * p6 past the end of the literals column and the copy ran off the
+         * heap — fuzzing under guard pages caught it.  Each read is checked
+         * against its own column's length, each write against tn. */
         while (p1 < ul[0]) {
+            if (ti >= tn) { rc = -1; goto out; }
             uint8_t tag = ct[p1++]; tok[ti++] = tag;
             uint32_t len = 0; int sh = 0;
-            while (1) {
+            for (;;) {
+                if (p2 >= ul[1] || ti >= tn || sh > 28) { rc = -1; goto out; }
                 uint8_t b = cln[p2++];
                 tok[ti++] = b;
                 len |= (uint32_t)(b & 0x7F) << sh;
                 if (!(b & 0x80)) break;
                 sh += 7;
             }
-            if (tag == 0) { memcpy(tok + ti, cx + p6, len); ti += len; p6 += len; }
-            else {
+            if (tag == 0) {
+                if (p6 > ul[5] || (size_t)len > ul[5] - p6 ||
+                    (size_t)len > tn - ti) { rc = -1; goto out; }
+                memcpy(tok + ti, cx + p6, len); ti += len; p6 += len;
+            } else {
+                if (ul[2] < 2 || p3 > ul[2] - 2) { rc = -1; goto out; }
                 uint32_t dist = (uint32_t)cdl[p3] | ((uint32_t)cdl[p3+1] << 8); p3 += 2;
                 uint32_t dh = 0; sh = 0;
-                while (1) {
+                for (;;) {
+                    if (p4 >= ul[3] || sh > 28) { rc = -1; goto out; }
                     uint8_t b = cdh[p4++];
                     dh |= (uint32_t)(b & 0x7F) << sh;
                     if (!(b & 0x80)) break;
                     sh += 7;
                 }
                 dist |= dh << 16;
-                do { uint8_t b = dist & 0x7F; dist >>= 7; if (dist) b |= 0x80; tok[ti++] = b; } while (dist);
+                do {
+                    if (ti >= tn) { rc = -1; goto out; }
+                    uint8_t b = dist & 0x7F; dist >>= 7; if (dist) b |= 0x80; tok[ti++] = b;
+                } while (dist);
                 if (tag == 2) {
                     uint32_t nex = 0; sh = 0;
-                    while (1) {
+                    for (;;) {
+                        if (p5 >= ul[4] || ti >= tn || sh > 28) { rc = -1; goto out; }
                         uint8_t b = ce[p5++];
                         tok[ti++] = b;
                         nex |= (uint32_t)(b & 0x7F) << sh;
@@ -916,7 +958,12 @@ static int ref_unpack2(const uint8_t *pl, size_t pln, uint8_t *tok, size_t tn) {
                         sh += 7;
                     }
                     for (uint32_t e = 0; e < nex; e++) {
-                        while (1) { uint8_t b = ce[p5++]; tok[ti++] = b; if (!(b & 0x80)) break; }
+                        for (;;) {
+                            if (p5 >= ul[4] || ti >= tn) { rc = -1; goto out; }
+                            uint8_t b = ce[p5++]; tok[ti++] = b;
+                            if (!(b & 0x80)) break;
+                        }
+                        if (p5 >= ul[4] || ti >= tn) { rc = -1; goto out; }
                         tok[ti++] = ce[p5++];
                     }
                 }
@@ -924,6 +971,7 @@ static int ref_unpack2(const uint8_t *pl, size_t pln, uint8_t *tok, size_t tn) {
         }
         if (ti != tn) rc = -1;
     }
+out:
     for (int i = 0; i < REF2_NSUB; i++) free(ub[i]);
     return rc;
 }
@@ -1240,7 +1288,7 @@ static void *seg_worker(void *arg) {
 }
 static int h_dec_seg(const uint8_t **sp, const uint8_t *end, uint8_t *dst, size_t n) {
     const uint8_t *src = *sp;
-    if ((size_t)(end - src) < 1 + 4*HUFF_SEGS) return -1;
+    if (REMAIN(src,end) < 1 + 4*HUFF_SEGS) return -1;
     int segs = *src++;
     if (segs != HUFF_SEGS) return -1;
     uint32_t lens[4];
@@ -1288,7 +1336,7 @@ static int h_dec_seg(const uint8_t **sp, const uint8_t *end, uint8_t *dst, size_
 
 static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n);
 static int h_dec_p(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n,int prefix){
-    const uint8_t *src=*sp;if((size_t)(end-src)<264)return-1;
+    const uint8_t *src=*sp;if(REMAIN(src,end)<264)return-1;
     uint8_t lens[256];for(int i=0;i<256;i++)lens[i]=src[i];
     uint32_t ul=(uint32_t)src[256]|((uint32_t)src[257]<<8)|((uint32_t)src[258]<<16)|((uint32_t)src[259]<<24);
     uint32_t bsl=(uint32_t)src[260]|((uint32_t)src[261]<<8)|((uint32_t)src[262]<<16)|((uint32_t)src[263]<<24);
@@ -1348,7 +1396,7 @@ static int h_dec_p(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n,i
     *sp=bse;return 0;
 }
 static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n){
-    const uint8_t *src=*sp;if((size_t)(end-src)<264)return-1;
+    const uint8_t *src=*sp;if(REMAIN(src,end)<264)return-1;
     uint8_t lens[256];for(int i=0;i<256;i++)lens[i]=src[i];
     uint32_t ul=(uint32_t)src[256]|((uint32_t)src[257]<<8)|((uint32_t)src[258]<<16)|((uint32_t)src[259]<<24);
     uint32_t bsl=(uint32_t)src[260]|((uint32_t)src[261]<<8)|((uint32_t)src[262]<<16)|((uint32_t)src[263]<<24);
@@ -2328,11 +2376,25 @@ static size_t rle_max_run_bytes(size_t gs) {
 
 int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
     const uint8_t *s=(const uint8_t*)sv; uint8_t *d=(uint8_t*)dv;
-    const CPEncHeader *h=(const CPEncHeader*)s;
     if(sl<CPENC_HEADER_SIZE) return -1;
+    /* Copy the header out rather than casting: the API takes const void*, so
+     * a caller may legitimately hand over a slice that is not 4-byte
+     * aligned, and the cast made that undefined behaviour (fuzzing found it
+     * with UBSan).  The container always passes malloc'd blocks, but there
+     * is no reason for the contract to require it. */
+    CPEncHeader hb;
+    memcpy(&hb, s, sizeof hb);
+    const CPEncHeader *h = &hb;
     /* v1 blocks (no stride remainder) remain decodable; reject only
      * unknown versions and garbage magic */
     if(h->magic!=CPENC_MAGIC||h->version<1||h->version>CPENC_VERSION) return -1;
+    if(h->original_size > CPENC_MAX_BLOCK) return -1;
+    /* Same ceiling on the compressed side.  A block cannot legitimately be
+     * larger than the data it holds (RAW costs original_size + 13), so
+     * anything past this is a caller handing over a length it computed from
+     * a corrupt field — and every subsequent bounds check inside would be
+     * arithmetic on a pointer that far out of range. */
+    if(sl > (size_t)CPENC_MAX_BLOCK + 64) return -1;
     if(h->stride==CPENC_STRIDE_SEG){
         /* v5: independent sub-blocks, lengths in a u32 array */
         const uint8_t *p = s + CPENC_HEADER_SIZE;
@@ -2448,6 +2510,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 if(oi >= n_sep) break;
                 uint32_t idx = 0; int sh = 0;
                 for (;;) {
+                    if (sh > 28) { free(tmp); return -1; }
                     uint8_t b = tab[oi++];
                     idx |= (uint32_t)(b & 0x7F) << sh;
                     if (!(b & 0x80)) break;
@@ -2464,6 +2527,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         while(oi < n_sep) {                  /* trailing entries (idx == bin_len) */
             uint32_t idx = 0; int sh = 0;
             for (;;) {
+                if (oi >= n_sep || sh > 28) { free(tmp); return -1; }
                 uint8_t b = tab[oi++];
                 idx |= (uint32_t)(b & 0x7F) << sh;
                 if (!(b & 0x80)) break;
@@ -2505,13 +2569,23 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         if(sl < CPENC_HEADER_SIZE + CPENC_HEADER_SIZE) return -1;
         if(*dl < h->original_size) return -1;
         const uint8_t *rp = s + CPENC_HEADER_SIZE;
+        /* The stream length comes from the same untrusted header as
+         * everything else, so it has to be checked against what is actually
+         * there before it is handed to the inner decoder as a buffer length:
+         * a header claiming more than the block holds made the inner decode
+         * read past the end (fuzzing caught it; REF2 already had this check
+         * and REF did not). */
+        size_t pln = h->compressed_size;
+        if(pln > (size_t)(sl - CPENC_HEADER_SIZE) || pln < CPENC_HEADER_SIZE) return -1;
         uint32_t tn = (uint32_t)rp[4] | ((uint32_t)rp[5]<<8) |
                       ((uint32_t)rp[6]<<16) | ((uint32_t)rp[7]<<24);
-        if(!tn) return -1;
+        /* tn comes from the payload: bound it against the output it can
+         * possibly produce before it becomes a malloc size. */
+        if(!tn || tn > (size_t)h->original_size * 4 + 64) return -1;
         uint8_t *tok = malloc(tn);
         if(!tok) return -2;
         size_t outl = tn;
-        if(cpenc_decompress(rp, h->compressed_size, tok, &outl) != 0 || outl != tn){
+        if(cpenc_decompress(rp, pln, tok, &outl) != 0 || outl != tn){
             free(tok); return -1;
         }
         int rc = ref_decode(tok, tn, d, h->original_size);
@@ -2531,7 +2605,9 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         if(pln > (size_t)(sl - CPENC_HEADER_SIZE) || pln < REF2_HDR) return -1;
         uint32_t tn = (uint32_t)pl[0] | ((uint32_t)pl[1]<<8) |
                       ((uint32_t)pl[2]<<16) | ((uint32_t)pl[3]<<24);
-        if(!tn) return -1;
+        /* tn comes from the payload: bound it against the output it can
+         * possibly produce before it becomes a malloc size. */
+        if(!tn || tn > (size_t)h->original_size * 4 + 64) return -1;
         uint8_t *tok = malloc(tn);
         if(!tok) return -2;
         if(ref_unpack2(pl, pln, tok, tn) != 0){ free(tok); return -1; }
@@ -2576,18 +2652,18 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         uint8_t *gp=trans+g*gs;
 
         if(tag==3){
-            if((size_t)(edd-p)<4){if(stride>1)free(trans);return-1;}
+            if(REMAIN(p,edd)<4){if(stride>1)free(trans);return-1;}
             uint32_t rl=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
-            if(rl!=gs||(size_t)(edd-p)<rl){if(stride>1)free(trans);return-1;}
+            if(rl!=gs||REMAIN(p,edd)<rl){if(stride>1)free(trans);return-1;}
             memcpy(gp,p,rl);p+=rl;
         }else if(tag==0){
-            if((size_t)(edd-p)<6){if(stride>1)free(trans);return-1;}
+            if(REMAIN(p,edd)<6){if(stride>1)free(trans);return-1;}
             uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
             uint8_t val=*p++;p++;
             if(tgs!=gs){if(stride>1)free(trans);return-1;}
             memset(gp,val,gs);
         }else if(tag==1){
-            if((size_t)(edd-p)<6){if(stride>1)free(trans);return-1;}
+            if(REMAIN(p,edd)<6){if(stride>1)free(trans);return-1;}
             uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
             uint8_t nz1=*p++;int nz=nz1+1;
             if(nz>256){if(stride>1)free(trans);return-1;}
@@ -2608,7 +2684,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     uint8_t t64[64];
                     for (int k = 0; k < nz; k++) t64[k] = lut[k];
                     for (int k = nz; k < 64; k++) t64[k] = lut[0];
-                    for (; i + 16 <= gs && (size_t)(edd - p) >= 17; i += 16) {
+                    for (; i + 16 <= gs && REMAIN(p,edd) >= 17; i += 16) {
                         vst1q_u8(gp + i, ne_lut16(p, nbits, t64));
                         p += 2 * nbits;
                     }
@@ -2622,7 +2698,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     uint8_t t64[64];
                     for (int k = 0; k < nz; k++) t64[k] = lut[k];
                     for (int k = nz; k < 64; k++) t64[k] = lut[0];
-                    for (; i + 16 <= gs && (size_t)(edd - p) >= 17; i += 16) {
+                    for (; i + 16 <= gs && REMAIN(p,edd) >= 17; i += 16) {
                         _mm_storeu_si128((__m128i *)(gp + i), avx2_lut16(p, nbits, t64));
                         p += 2 * nbits;
                     }
@@ -2661,7 +2737,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         }else if(tag==6){
             /* bit planes: [8 markers][per plane: 1 value byte | pn packed
              * bytes | 4-byte count + (gap LEB, byte)*] */
-            if((size_t)(edd-p)<8){if(stride>1)free(trans);return-1;}
+            if(REMAIN(p,edd)<8){if(stride>1)free(trans);return-1;}
             const uint8_t *mk=p; p+=8;
             size_t pn_bp=(gs+7)/8;
             memset(gp,0,gs);
@@ -2670,12 +2746,12 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     if(p>=edd){if(stride>1)free(trans);return-1;}
                     if(*p++) for(size_t i2=0;i2<gs;i2++) gp[i2]|=(uint8_t)(1u<<b);
                 }else if(mk[b]==1){
-                    if((size_t)(edd-p)<pn_bp){if(stride>1)free(trans);return-1;}
+                    if(REMAIN(p,edd)<pn_bp){if(stride>1)free(trans);return-1;}
                     for(size_t i2=0;i2<gs;i2++)
                         if((p[i2>>3]>>(i2&7))&1) gp[i2]|=(uint8_t)(1u<<b);
                     p+=pn_bp;
                 }else{
-                    if((size_t)(edd-p)<4){if(stride>1)free(trans);return-1;}
+                    if(REMAIN(p,edd)<4){if(stride>1)free(trans);return-1;}
                     uint32_t nz=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
                     uint32_t prev=0;
                     for(uint32_t k=0;k<nz;k++){
@@ -2700,7 +2776,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             }
         }else if(tag==5){
             /* const + exceptions: [val][nex][pos LEB128][values] */
-            if((size_t)(edd-p)<6){if(stride>1)free(trans);return-1;}
+            if(REMAIN(p,edd)<6){if(stride>1)free(trans);return-1;}
             uint16_t cval=(uint16_t)(p[0]|(p[1]<<8));p+=2;
             uint32_t nex=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
             if(nex>gs){if(stride>1)free(trans);return-1;}
@@ -2709,7 +2785,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             for(uint32_t k=0;k<nex;k++){
                 uint32_t gap=0,shift=0;
                 for(;;){
-                    if(p>=edd){if(stride>1)free(trans);return-1;}
+                    if(p>=edd||shift>28){if(stride>1)free(trans);return-1;}
                     uint8_t b=*p++;
                     gap|=(uint32_t)(b&0x7F)<<shift;
                     if(!(b&0x80))break;
@@ -2730,13 +2806,13 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             if(!runs_buf||!vals_buf||!scratch){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
             size_t nr=0,nv=0;
             if(st==0){
-                if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(REMAIN(p,edd)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
                 uint8_t val=*p++;p++;
                 if(tgs>rb_cap){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<tgs;k++)runs_buf[nr++]=(uint32_t)val;
             }else if(st==1){
-                if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(REMAIN(p,edd)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
                 uint8_t nz1=*p++;int nz=nz1+1;
                 uint8_t lut[256];for(int i=0;i<nz;i++){if(p>=edd){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}lut[i]=*p++;}
@@ -2749,7 +2825,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     uint8_t t64[64], tmp[16];
                     for (int k = 0; k < nz; k++) t64[k] = lut[k];
                     for (int k = nz; k < 64; k++) t64[k] = lut[0];
-                    for (; i + 16 <= tgs && (size_t)(edd - p) >= 17; i += 16) {
+                    for (; i + 16 <= tgs && REMAIN(p,edd) >= 17; i += 16) {
                         vst1q_u8(tmp, ne_lut16(p, nbits, t64));
                         for (int j = 0; j < 16; j++) runs_buf[nr++] = (uint32_t)tmp[j];
                         p += 2 * nbits;
@@ -2761,7 +2837,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     uint8_t t64[64], tmp[16];
                     for (int k = 0; k < nz; k++) t64[k] = lut[k];
                     for (int k = nz; k < 64; k++) t64[k] = lut[0];
-                    for (; i + 16 <= tgs && (size_t)(edd - p) >= 17; i += 16) {
+                    for (; i + 16 <= tgs && REMAIN(p,edd) >= 17; i += 16) {
                         _mm_storeu_si128((__m128i *)tmp, avx2_lut16(p, nbits, t64));
                         for (int j = 0; j < 16; j++) runs_buf[nr++] = (uint32_t)tmp[j];
                         p += 2 * nbits;
@@ -2775,15 +2851,15 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                 }
             }else if(st==2){
                 /* huffman sub-block: symbol count lives in the stream header */
-                if((size_t)(edd-p)<264){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(REMAIN(p,edd)<264){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t rn=(uint32_t)p[256]|((uint32_t)p[257]<<8)|((uint32_t)p[258]<<16)|((uint32_t)p[259]<<24);
                 if(rn>rb_cap){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 if(h_dec(&p,edd,scratch,rn)<0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<rn;k++)runs_buf[nr++]=(uint32_t)scratch[k];
             }else if(st==3){
-                if((size_t)(edd-p)<4){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(REMAIN(p,edd)<4){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t rl=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
-                if(rl>rb_cap||(size_t)(edd-p)<rl){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(rl>rb_cap||REMAIN(p,edd)<rl){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<rl;k++)runs_buf[nr++]=(uint32_t)p[k];
                 p+=rl;
             }else if(st==4){
@@ -2797,13 +2873,13 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
             st=*p++;
 
             if(st==0){
-                if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(REMAIN(p,edd)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
                 uint8_t val=*p++;p++;
                 if(tgs>gs){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<tgs;k++)vals_buf[nv++]=(uint8_t)val;
             }else if(st==1){
-                if((size_t)(edd-p)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(REMAIN(p,edd)<6){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t tgs=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
                 uint8_t nz1=*p++;int nz=nz1+1;
                 uint8_t lut[256];for(int i=0;i<nz;i++){if(p>=edd){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}lut[i]=*p++;}
@@ -2816,7 +2892,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     uint8_t t64[64];
                     for (int k = 0; k < nz; k++) t64[k] = lut[k];
                     for (int k = nz; k < 64; k++) t64[k] = lut[0];
-                    for (; i + 16 <= tgs && (size_t)(edd - p) >= 17; i += 16) {
+                    for (; i + 16 <= tgs && REMAIN(p,edd) >= 17; i += 16) {
                         vst1q_u8(vals_buf + nv, ne_lut16(p, nbits, t64));
                         nv += 16;
                         p += 2 * nbits;
@@ -2828,7 +2904,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     uint8_t t64[64];
                     for (int k = 0; k < nz; k++) t64[k] = lut[k];
                     for (int k = nz; k < 64; k++) t64[k] = lut[0];
-                    for (; i + 16 <= tgs && (size_t)(edd - p) >= 17; i += 16) {
+                    for (; i + 16 <= tgs && REMAIN(p,edd) >= 17; i += 16) {
                         _mm_storeu_si128((__m128i *)(vals_buf + nv), avx2_lut16(p, nbits, t64));
                         nv += 16;
                         p += 2 * nbits;
@@ -2841,15 +2917,15 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     vals_buf[nv++]=(uint8_t)(idx<nz?lut[idx]:lut[0]);
                 }
             }else if(st==2){
-                if((size_t)(edd-p)<264){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(REMAIN(p,edd)<264){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t rn=(uint32_t)p[256]|((uint32_t)p[257]<<8)|((uint32_t)p[258]<<16)|((uint32_t)p[259]<<24);
                 if(rn>gs){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 if(h_dec(&p,edd,vals_buf,rn)<0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 nv=rn;
             }else if(st==3){
-                if((size_t)(edd-p)<4){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(REMAIN(p,edd)<4){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t rl=(uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24);p+=4;
-                if(rl>gs||(size_t)(edd-p)<rl){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(rl>gs||REMAIN(p,edd)<rl){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 memcpy(vals_buf,p,rl);nv=rl;p+=rl;
             }else if(st==4){
                 uint32_t tlen=0;
@@ -2870,7 +2946,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     /* escape: remainder in LEB128 — accumulate with + (r is
                      * preset 255 whose bits are all set; |= would no-op) */
                     for(;;){
-                        if(ri>=nr){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                        if(ri>=nr||shift>28){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                         uint8_t c2=(uint8_t)runs_buf[ri++];
                         r+=(uint32_t)(c2&0x7F)<<shift;
                         if(!(c2&0x80))break;
@@ -2902,7 +2978,7 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
         size_t gend = gs * (size_t)stride;
         if (orig > gend) {
             size_t rem = orig - gend;
-            if ((size_t)(edd - p) < rem) { if (stride > 1) free(trans); return -1; }
+            if (REMAIN(p,edd) < rem) { if (stride > 1) free(trans); return -1; }
             memcpy(trans + gend, p, rem);
             p += rem;
         }

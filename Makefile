@@ -1,4 +1,4 @@
-.PHONY: test clean all
+.PHONY: test clean all fuzz
 
 # Target-specific ISA flags: NEON on aarch64, a conservative x86-64 baseline
 # elsewhere (the NEON paths are compiled out there).  Override with ARCHFLAGS=.
@@ -62,5 +62,9 @@ test/avx2_lut_check: test/avx2_lut_check.c cpenc_avx2.h
 	cc $(CFLAGS) $(AVX2FLAGS) test/avx2_lut_check.c -o test/avx2_lut_check
 	./test/avx2_lut_check
 
+# Fuzz the decoder: libFuzzer + UBSan + guard pages (needs compiler-rt).
+fuzz:
+	sh test/fuzz.sh $(SECS)
+
 clean:
-	rm -f *.o *.so test/cpenc_test test/cpool_test test/bench_cpenc test/cpenc_verify test/cpenc_bisect test/cpenc_rle_test test/avx2_lut_check
+	rm -f *.o *.so test/cpenc_test test/cpool_test test/fuzz_seed test/fuzz_cpenc test/bench_cpenc test/cpenc_verify test/cpenc_bisect test/cpenc_rle_test test/avx2_lut_check
