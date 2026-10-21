@@ -2068,7 +2068,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                 if(sub5_encode(&out,edd,r8,nr8,rq)!=0){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
             }else if(st==1){
                 int rb=1;while((1<<rb)<rnz&&rb<HUFF_MAX)rb++;
-                uint8_t lut[32],rev[256]={0};int li=0;
+                uint8_t lut[256],rev[256]={0};int li=0;
                 for(int i2=0;i2<256&&li<rnz;i2++)if(rq[i2]){lut[li]=(uint8_t)i2;rev[i2]=(uint8_t)li;li++;}
                 size_t need=6+(size_t)rnz+nr8*(size_t)rb/8+1;
                 if((size_t)(edd-out)<need){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
@@ -2105,7 +2105,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                 if(sub5_encode(&out,edd,vls,nv,vq)!=0){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
             }else if(st==1){
                 int vb=1;while((1<<vb)<vnz&&vb<HUFF_MAX)vb++;
-                uint8_t lut[32],rev[256]={0};int li=0;
+                uint8_t lut[256],rev[256]={0};int li=0;
                 for(int i2=0;i2<256&&li<vnz;i2++)if(vq[i2]){lut[li]=(uint8_t)i2;rev[i2]=(uint8_t)li;li++;}
                 size_t need=6+(size_t)vnz+nv*(size_t)vb/8+1;
                 if((size_t)(edd-out)<need){free(r8);free(runs);free(vls);free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
@@ -2161,7 +2161,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             }
         }else if(tag==1){
             int bits=1;while((1<<bits)<nz&&bits<HUFF_MAX)bits++;
-            uint8_t lut[32],rev[256]={0};int li=0;
+            uint8_t lut[256],rev[256]={0};int li=0;
             for(int i=0;i<256&&li<nz;i++)if(fq[i]){uint8_t v=(uint8_t)i;lut[li]=v;rev[v]=(uint8_t)li;li++;}
             size_t need=6+(size_t)nz+gs*(size_t)bits/8+1;
             if((size_t)(edd-out)<need){free(trial);free(trans);free(lagbuf);free(hexbuf);return-1;}
@@ -2451,7 +2451,11 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         if(sl < CPENC_HEADER_SIZE + 4) return -1;
         uint32_t n_seg = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
         p += 4;
-        uint32_t max_seg = h->original_size / 4 + 1;   /* segments are an encoder choice */
+        /* The encoder splits at CPENC_SEG_SIZE, so a block cannot hold more
+         * segments than that implies.  The old /4 bound allowed 64M segments
+         * in a 256MB block, and the per-segment job arrays sized from it
+         * were a multi-gigabyte allocation (fuzzing found it at 1.9GB RSS). */
+        uint32_t max_seg = h->original_size / CPENC_SEG_SIZE + 2;
         if(n_seg < 1 || n_seg > max_seg) return -1;
         if(sl < CPENC_HEADER_SIZE + 4 + (size_t)n_seg * 4) return -1;
         const uint8_t *sp = p + (size_t)n_seg * 4;
