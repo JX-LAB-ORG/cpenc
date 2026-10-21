@@ -81,10 +81,13 @@ int main(int argc, char **argv) {
     if (!cbuf || !clen || !olen || !dec) { fprintf(stderr, "alloc\n"); return 1; }
 
     size_t bound = cpenc_max_compressed_size(blk);
-    for (size_t i = 0; i < nblk; i++) {
-        cbuf[i] = malloc(bound);
-        if (!cbuf[i]) { fprintf(stderr, "alloc\n"); return 1; }
-    }
+    /* One scratch buffer, and each block keeps only its actual compressed
+     * size.  Allocating a full worst-case buffer per block — as this did —
+     * costs about 1.5x the input, which is fine for a 64MB corpus and fatal
+     * for the 673MB disk image this has to measure. */
+    uint8_t *scratch = malloc(bound);
+    if (!scratch) { fprintf(stderr, "alloc scratch\n"); return 1; }
+    for (size_t i = 0; i < nblk; i++) cbuf[i] = NULL;   /* sized after compressing */
 
     uint64_t hist[6] = {0};
     size_t total_orig = 0, total_comp = 0;
@@ -99,10 +102,16 @@ int main(int argc, char **argv) {
             size_t off = i * blk;
             size_t len = (size_t)n - off < blk ? (size_t)n - off : blk;
             size_t cl = bound;
-            if (cpenc_compress(src + off, len, cbuf[i], &cl, order) != 0) {
+            if (cpenc_compress(src + off, len, scratch, &cl, order) != 0) {
                 fprintf(stderr, "compress fail at block %zu\n", i);
                 return 1;
             }
+            /* keep only this block's actual bytes: the timing loop runs
+             * more than once, so the previous copy goes first */
+            free(cbuf[i]);
+            cbuf[i] = malloc(cl ? cl : 1);
+            if (!cbuf[i]) { fprintf(stderr, "alloc block %zu\n", i); return 1; }
+            memcpy(cbuf[i], scratch, cl);
             clen[i] = cl;
             olen[i] = len;
             co += len; cc += cl;
@@ -158,6 +167,6 @@ int main(int argc, char **argv) {
     printf("]%s\n", bad ? "  ROUNDTRIP-FAIL" : "");
 
     for (size_t i = 0; i < nblk; i++) free(cbuf[i]);
-    free(cbuf); free(clen); free(olen); free(dec); free(src);
+    free(cbuf); free(clen); free(olen); free(dec); free(scratch); free(src);
     return bad ? 1 : 0;
 }
