@@ -5,8 +5,12 @@
 ARCH := $(shell uname -m)
 ifeq ($(ARCH),aarch64)
 ARCHFLAGS ?= -march=armv8-a+simd
+AVX2FLAGS ?=
 else
 ARCHFLAGS ?= -march=x86-64-v2
+# x86-64-v2 has no AVX2, so the AVX2 kernel is off by default; the check
+# target turns it on explicitly.  Appended after $(CFLAGS) so it wins.
+AVX2FLAGS ?= -mavx2
 endif
 CFLAGS = -std=c11 -D_GNU_SOURCE -fPIC -Wall -O3 $(ARCHFLAGS) -I.
 
@@ -52,5 +56,11 @@ test/cpenc_verify: test/cpenc_verify.c cpenc.o bwt.o
 test/cpenc_bisect: test/cpenc_bisect.c cpenc.o bwt.o
 	cc $(CFLAGS) test/cpenc_bisect.c cpenc.o bwt.o -lm -o test/cpenc_bisect
 
+# AVX2 LUT decode kernel vs the scalar reference.  Needs -mavx2 on x86-64;
+# on aarch64 it builds the stub main (nothing to check there).
+test/avx2_lut_check: test/avx2_lut_check.c cpenc_avx2.h
+	cc $(CFLAGS) $(AVX2FLAGS) test/avx2_lut_check.c -o test/avx2_lut_check
+	./test/avx2_lut_check
+
 clean:
-	rm -f *.o *.so test/cpenc_test test/cpool_test test/bench_cpenc test/cpenc_verify test/cpenc_bisect test/cpenc_rle_test
+	rm -f *.o *.so test/cpenc_test test/cpool_test test/bench_cpenc test/cpenc_verify test/cpenc_bisect test/cpenc_rle_test test/avx2_lut_check

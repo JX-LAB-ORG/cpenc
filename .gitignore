@@ -4,3 +4,7 @@ test/*_test
 test/*_disk_test
 libcpool_hook.so
 test/cpenc_bench
+test/avx2_lut_check
+test/bench_cpenc
+test/cpenc_bisect
+test/cpenc_verify

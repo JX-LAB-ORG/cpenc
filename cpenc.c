@@ -10,6 +10,9 @@
 #if defined(__aarch64__)
 #include "cpenc_neon.h"
 #endif
+#if defined(__x86_64__) && defined(__AVX2__)
+#include "cpenc_avx2.h"
+#endif
 
 #define HUFF_MAX 12
 #define HUFF_WSZ (1<<HUFF_MAX)
@@ -2611,6 +2614,20 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     }
                 }
 #endif
+#if defined(__x86_64__) && defined(__AVX2__)
+                /* AVX2: same 16-symbol batch contract as the NEON path, so
+                 * the bounds, the 2*nbits stride and the scalar tail below
+                 * are unchanged. */
+                if (nz <= 64) {
+                    uint8_t t64[64];
+                    for (int k = 0; k < nz; k++) t64[k] = lut[k];
+                    for (int k = nz; k < 64; k++) t64[k] = lut[0];
+                    for (; i + 16 <= gs && (size_t)(edd - p) >= 17; i += 16) {
+                        _mm_storeu_si128((__m128i *)(gp + i), avx2_lut16(p, nbits, t64));
+                        p += 2 * nbits;
+                    }
+                }
+#endif
                 /* Process 4 bytes (32 bits) at a time where possible */
                 for (; i + 4 <= gs; i += 4) {
                     /* Fill exactly the 4 symbols' worth of bits: the old
@@ -2739,6 +2756,18 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     }
                 }
 #endif
+#if defined(__x86_64__) && defined(__AVX2__)
+                if (nbits <= 8 && nz <= 64) {
+                    uint8_t t64[64], tmp[16];
+                    for (int k = 0; k < nz; k++) t64[k] = lut[k];
+                    for (int k = nz; k < 64; k++) t64[k] = lut[0];
+                    for (; i + 16 <= tgs && (size_t)(edd - p) >= 17; i += 16) {
+                        _mm_storeu_si128((__m128i *)tmp, avx2_lut16(p, nbits, t64));
+                        for (int j = 0; j < 16; j++) runs_buf[nr++] = (uint32_t)tmp[j];
+                        p += 2 * nbits;
+                    }
+                }
+#endif
                 for(;i<tgs;i++){
                     while(rbc<nbits&&p<edd){rbuf|=(uint64_t)(*p++)<<rbc;rbc+=8;}
                     uint8_t idx=rbuf&((1<<nbits)-1);rbuf>>=nbits;rbc-=nbits;
@@ -2789,6 +2818,18 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
                     for (int k = nz; k < 64; k++) t64[k] = lut[0];
                     for (; i + 16 <= tgs && (size_t)(edd - p) >= 17; i += 16) {
                         vst1q_u8(vals_buf + nv, ne_lut16(p, nbits, t64));
+                        nv += 16;
+                        p += 2 * nbits;
+                    }
+                }
+#endif
+#if defined(__x86_64__) && defined(__AVX2__)
+                if (nbits <= 8 && nz <= 64) {
+                    uint8_t t64[64];
+                    for (int k = 0; k < nz; k++) t64[k] = lut[k];
+                    for (int k = nz; k < 64; k++) t64[k] = lut[0];
+                    for (; i + 16 <= tgs && (size_t)(edd - p) >= 17; i += 16) {
+                        _mm_storeu_si128((__m128i *)(vals_buf + nv), avx2_lut16(p, nbits, t64));
                         nv += 16;
                         p += 2 * nbits;
                     }

@@ -132,8 +132,8 @@ static inline uint8x16_t ne_lut16(const uint8_t *restrict s, int nbits,
     /* index >= 64 is invalid (nz<=64); map to 0 so padding yields lut[0] */
     uint8x16_t idxc = vbslq_u8(vcltq_u8(idx, vdupq_n_u8(64)), idx,
                                vdupq_n_u8(0));
-    uint8x16x4_t tt = { vld1q_u8(t64), vld1q_u8(t64 + 16),
-                        vld1q_u8(t64 + 32), vld1q_u8(t64 + 48) };
+    uint8x16x4_t tt = { { vld1q_u8(t64), vld1q_u8(t64 + 16),
+                          vld1q_u8(t64 + 32), vld1q_u8(t64 + 48) } };
     return vqtbl4q_u8(tt, idxc);
 }
 
