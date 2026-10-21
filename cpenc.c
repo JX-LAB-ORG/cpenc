@@ -1299,8 +1299,15 @@ static int h_dec_seg(const uint8_t **sp, const uint8_t *end, uint8_t *dst, size_
     size_t segn = (n + HUFF_SEGS - 1) / HUFF_SEGS;
     const uint8_t *segp[HUFF_SEGS];
     segp[0] = src;
-    for (int k = 1; k < HUFF_SEGS; k++) segp[k] = segp[k-1] + lens[k-1];
-    if ((size_t)(end - segp[HUFF_SEGS-1]) < lens[HUFF_SEGS-1]) return -1;
+    /* Validate every segment as it is laid out, not just the last one: the
+     * lengths come from the stream, and with a raised lens[0] the later
+     * starts land past `end`, where the old end-minus-start check wrapped
+     * and passed.  That is how a corrupt block reached h_dec with an end
+     * pointer beyond its buffer. */
+    for (int k = 0; k < HUFF_SEGS; k++) {
+        if (segp[k] > end || REMAIN(segp[k], end) < lens[k]) return -1;
+        if (k + 1 < HUFF_SEGS) segp[k+1] = segp[k] + lens[k];
+    }
     /* 2 workers x 2 segments, segments independent.  Threads are the
      * default (real hardware scales ~linearly); CPENC_NO_THREADS=1 falls
      * back to sequential where thread scheduling misbehaves (PRoot). */
@@ -2374,7 +2381,50 @@ static size_t rle_max_run_bytes(size_t gs) {
     return gs/2 + 2 + 5*(gs/255) + 8;
 }
 
+/* ── Nested-call range check ─────────────────────────────────────
+ * Every nested decompress works on bytes its caller was given: either a
+ * slice of that stream, or a fresh copy (the hex layer makes one).  A call
+ * that is neither has had its pointer or its length computed from an
+ * untrusted field incorrectly — and once that happens every bounds check
+ * further down is arithmetic on a lie, which is how a corrupted block
+ * reached h_dec with an end pointer beyond its buffer.  Checking here costs
+ * a few compares per block, not per byte, and refuses the block instead. */
+#define CPENC_MAX_NEST 8
+static __thread const void *g_rb[CPENC_MAX_NEST];
+static __thread size_t      g_rn[CPENC_MAX_NEST];
+static __thread int         g_rd;
+
+static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl);
+
 int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
+    uintptr_t b0 = (uintptr_t)sv, b1 = b0 + sl;
+    /* Nesting has a natural bound: hex and the reference layers each wrap
+     * one inner block, so a real block is at most two or three deep.  A
+     * crafted one can nest arbitrarily far and blow the stack (fuzzing found
+     * that as a stack-overflow before it found anything else). */
+    if (g_rd >= CPENC_MAX_NEST) return -1;
+    if (g_rd > 0) {
+        uintptr_t p0 = (uintptr_t)g_rb[g_rd - 1], p1 = p0 + g_rn[g_rd - 1];
+        int inside   = (b0 >= p0 && b1 <= p1);
+        int disjoint = (b1 <= p0 || b0 >= p1);
+        if (!inside && !disjoint) {
+#ifdef CPENC_RANGE_REPORT
+            fprintf(stderr, "RANGE: [%p,+%zu) neither within nor disjoint from [%p,+%zu) ra=%p\n",
+                    (void *)b0, sl, (void *)p0, g_rn[g_rd - 1], __builtin_return_address(0));
+            abort();
+#endif
+            return -1;
+        }
+    }
+    int save = g_rd;
+    if (g_rd < CPENC_MAX_NEST) { g_rb[g_rd] = sv; g_rn[g_rd] = sl; }
+    g_rd++;
+    int rc = cpenc_decompress_impl(sv, sl, dv, dl);
+    g_rd = save;
+    return rc;
+}
+
+static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl) {
     const uint8_t *s=(const uint8_t*)sv; uint8_t *d=(uint8_t*)dv;
     if(sl<CPENC_HEADER_SIZE) return -1;
     /* Copy the header out rather than casting: the API takes const void*, so
