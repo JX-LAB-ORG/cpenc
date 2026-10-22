@@ -66,5 +66,9 @@ test/avx2_lut_check: test/avx2_lut_check.c cpenc_avx2.h
 fuzz:
 	sh test/fuzz.sh $(SECS)
 
+# Fuzz encoder/decoder agreement: compress, decompress, insist on equality.
+fuzz-rt:
+	sh test/fuzz_rt.sh $(SECS)
+
 clean:
-	rm -f *.o *.so test/cpenc_test test/cpool_test test/fuzz_seed test/fuzz_cpenc test/bench_cpenc test/cpenc_verify test/cpenc_bisect test/cpenc_rle_test test/avx2_lut_check
+	rm -f *.o *.so test/cpenc_test test/cpool_test test/fuzz_seed test/fuzz_cpenc test/fuzz_roundtrip test/bench_cpenc test/cpenc_verify test/cpenc_bisect test/cpenc_rle_test test/avx2_lut_check

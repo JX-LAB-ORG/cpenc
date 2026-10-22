@@ -10,3 +10,4 @@ test/cpenc_bisect
 test/cpenc_verify
 test/fuzz_seed
 test/fuzz_cpenc
+test/fuzz_roundtrip
