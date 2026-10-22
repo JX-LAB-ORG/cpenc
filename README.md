@@ -3,8 +3,8 @@
 Compress one block of data into a self-contained CPEnc stream, and get it back
 byte for byte. No container, no filesystem, no daemon: memory in, memory out.
 
-[libcfs](../libcfs) uses it to give 8MB blocks random-access compression; it
-also works as a standalone library.
+[libcfs](../libcfs), the Container File System (CFS), uses it to give 8MB
+blocks random-access compression; it also works as a standalone library.
 
 ## What it is / what it is not
 
