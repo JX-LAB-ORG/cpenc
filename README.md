@@ -1,108 +1,129 @@
-# libcpool — CPEnc 块编解码器
+# libcpool — the CPEnc block codec
 
-把一个数据块压成一段自包含的 CPEnc 流，再原样解回来。没有容器、没有文件系统、
-没有守护进程：输入一段内存，输出一段内存。
+Compress one block of data into a self-contained CPEnc stream, and get it back
+byte for byte. No container, no filesystem, no daemon: memory in, memory out.
 
-[libcfs](../libcfs) 用它在 8MB 块上做随机访问压缩；它也可以单独当库用。
+[libcfs](../libcfs) uses it to give 8MB blocks random-access compression; it
+also works as a standalone library.
 
-## 它是什么 / 不是什么
+## What it is / what it is not
 
-**是**：为"结构化但不像文本"的数据设计的压缩器——数值表、二进制记录、日志
-dump、权重张量。它按块在几种模型里挑一个（转置、差分、BWT、引用），挑错了
-就退回 RAW，所以最坏情况是**不压缩**，不是**压坏**。
+**It is** a compressor built for data that is structured but does not look like
+text — numeric tables, binary records, log dumps, weight tensors. Per block it
+picks one of several models (transpose, delta, BWT, references) and falls back
+to RAW when the pick does not pay, so the worst case is **no compression**,
+never **corruption**.
 
-**不是**：通用压缩器。对同一份 673MB 的 ext4 镜像：
+**It is not** a general-purpose compressor. On the same 673MB ext4 image:
 
-| 工具 | 比率 | 压缩 | 解压 |
+| Tool | Ratio | Compress | Decompress |
 |---|---:|---:|---:|
-| **cpenc** | **3.68×** | **4.29 MB/s** | **164 MB/s** |
-| xz -9 | 6.51× | 0.82 MB/s | 64 MB/s |
-| zstd -19 | 5.20× | 1.07 MB/s | 119 MB/s |
-| gzip -9 | 3.42× | 8.46 MB/s | 87 MB/s |
-| lz4 -12 | 2.94× | 18.57 MB/s | 970 MB/s |
+| **cpenc** | **3.68x** | **4.29 MB/s** | **164 MB/s** |
+| xz -9 | 6.51x | 0.82 MB/s | 64 MB/s |
+| zstd -19 | 5.20x | 1.07 MB/s | 119 MB/s |
+| gzip -9 | 3.42x | 8.46 MB/s | 87 MB/s |
+| lz4 -12 | 2.94x | 18.57 MB/s | 970 MB/s |
 
-也就是说：比率比强压缩器低 29–43%，但压缩快 4–5 倍，解压是强压缩器里最快的。
-要的是"随机访问一个块"的场合，不是"把归档压到最小"。
+In other words: 29–43% below the strong compressors on ratio, but 4–5x faster
+to compress, and the fastest to decompress among them. It is for "read one
+block at random", not for "make the archive as small as possible".
 
-## 构建
+## Building
 
 ```sh
-make            # 产出 cpenc.o / bwt.o / cpool.o / libcpool_hook.so
-make test       # 5 套件
-make bench      # 基准工具
+make            # cpenc.o / bwt.o / cpool.o / libcpool_hook.so
+make test       # 5 suites
+make bench      # benchmark tools
 ```
 
-需要 C11 和 pthread。x86-64 默认 `-march=x86-64-v2`；AVX2 内核要
-`make ARCHFLAGS=-march=x86-64-v3`（见下面的"已知边界"）。
+Needs C11 and pthread. x86-64 builds with `-march=x86-64-v2` by default; the
+AVX2 kernel needs `make ARCHFLAGS=-march=x86-64-v3` (see "Known limits").
 
 ## API
 
 ```c
 #include "cpenc.h"
 
-size_t cap = cpenc_max_compressed_size(n);      /* 上界，含全部开销 */
-int  cpenc_compress(src, n, dst, &cap, order);  /* 0 成功；dst_len 出实际大小 */
-int  cpenc_decompress(src, cap, dst, &n);       /* 0 成功；dst_len 先给容量，出实际大小 */
+size_t cap = cpenc_max_compressed_size(n);      /* upper bound, all overhead included */
+int  cpenc_compress(src, n, dst, &cap, order);  /* 0 on success; dst_len returns the real size */
+int  cpenc_decompress(src, cap, dst, &n);       /* 0 on success; dst_len: capacity in, real size out */
 ```
 
-- `order`（0–4）：搜索强度。0 最快、4 比率最好；libcfs 用 2。
-- **块是独立的**：解压第 k 块不需要前面的块。这就是随机访问的来源。
-- **确定性**：同一输入、同一 `order`，输出字节完全相同（有测试守着）。
-- 单块上限 `CPENC_MAX_BLOCK` = 256MB；超过的解码端直接拒绝。
+- `order` (0–4): search effort. 0 is fastest, 4 gives the best ratio; libcfs
+  uses 2.
+- **Blocks are independent**: decompressing block k needs no earlier block.
+  That is where random access comes from.
+- **Deterministic**: the same input and the same `order` produce identical
+  bytes (a test guards this).
+- One block is capped at `CPENC_MAX_BLOCK` = 256MB; a decoder rejects anything
+  larger.
 
-## 格式
+## Format
 
 ```
-[12 字节头: magic u16 | version u8 | stride u8 | orig u32 | comp u32][负载]
+[12-byte header: magic u16 | version u8 | stride u8 | orig u32 | comp u32][payload]
 ```
 
-`stride` 说明这一段用的是哪个模型：
+`stride` says which model this block used:
 
-| stride | 名称 | 用途 |
+| stride | Name | Purpose |
 |---|---|---|
-| 0xFF | RAW | 原样存放（压缩不划算时） |
-| 0xFE | HEX | 十六进制文本 → 半字节折叠 |
-| 0xFD | SEG | 内部分段，每段独立挑模型 |
-| 0xFC | BWT | 重排后走差分/游程 |
-| 0xFB / 0xFA | REF / REF2 | 重复串做成引用（REF2 是列式 token 流） |
+| 0xFF | RAW | stored as-is (when compressing does not pay) |
+| 0xFE | HEX | hex text → nibble folding |
+| 0xFD | SEG | internal segmentation, each segment picks its own model |
+| 0xFC | BWT | reorder, then delta/run coding |
+| 0xFB / 0xFA | REF / REF2 | repeated strings as references (REF2 is a columnar token stream) |
 
-组内编码器还有几种 tag（常量、LUT、Huffman、游程、常量+例外、位平面），
-细节在 `cpenc.c` 的注释里。**解码端不信任头里的任何长度**：越界、回绕、
-嵌套深度、段数都有上界，模糊测试就是冲这些来的。
+Within a group the encoder has several tags (constant, LUT, Huffman, run
+length, constant plus exceptions, bit planes); the details are in the comments
+in `cpenc.c`. **The decoder trusts no length in the header**: out-of-range
+values, wraparound, nesting depth and segment count all have bounds, and the
+fuzzers exist to keep them honest.
 
-## 测试
+## Testing
 
 ```sh
-make test       # 5 套件：边界尺寸 / 特殊模式 / 随机往返 / 重压稳定性 / RLE
-make fuzz SECS=300      # 解码器：畸形流、UBSan、保护页
-make fuzz-rt SECS=300   # 编码往返：压出来必须解得回、且字节一致
+make test       # 5 suites: boundary sizes / special patterns / random round-trip / recompression / RLE
+make fuzz SECS=300      # decoder: malformed streams, UBSan, guard pages
+make fuzz-rt SECS=300   # encoder round-trip: what it produces must decode, byte for byte
 ```
 
-两个模糊靶子问的是**不同的问题**，都必要：
+The two fuzz targets ask **different questions**, and both are necessary:
 
-- `fuzz`：敌意输入能不能被安全解码（找的是越界、未定义行为）。
-- `fuzz-rt`：**编码器自己的输出能不能解回来**。这个靶子抓到过两个真 bug——
-  一个非对齐块头写、一个 hex 层丢大小写，解码侧靶子结构上不可能发现。
+- `fuzz`: can a hostile stream be decoded safely (bounds, undefined behaviour)?
+- `fuzz-rt`: **does the encoder's own output decode?** That target has caught
+  two real bugs — an unaligned header write and the hex layer dropping case —
+  neither of which a decode-side target can see even in principle.
 
-需要 `compiler-rt`（`apk add compiler-rt`）。ASan 在本项目的开发环境（PRoot）
-下跑不起来，所以用的是 UBSan + `PROT_NONE` 保护页。
+Needs `compiler-rt` (`apk add compiler-rt`). ASan does not run in this
+project's development environment (PRoot), so the targets use UBSan plus
+`PROT_NONE` guard pages.
 
-## 已知边界
+## Known limits
 
-- **hex 层有硬门槛**：≥90% 十六进制字符、<1% 外来字符、大小写统一，才启用。
-  所以带 `0x` 前缀的 dump 通常**不会**走这一层（`x` 就算外来字符）。
-- **AVX2 内核端到端几乎不体现**：内核本身 3.44×（1MB 组、nz=16、4bit/符号），
-  但真实数据的分块 100% 落在 REF2/SEG 上，时间花在引用拷贝而不是 LUT 展开
-  （94MB tar：524 → 529 MB/s）。它是为 LUT 型块准备的，不是通用加速。
-- **压缩速度慢**：单线程 4–14 MB/s。libcfs 靠 8MB 块并行摊掉，`cpool` 那层
-  另有线程池；纯单线程场景别指望它跟 gzip 比速度。
-- **不加密、不校验**：块里没有校验和。损坏检测靠 libcfs 的 `verify`（重新解码）
-  或外部工具，压进去的字节本身不做完整性保护。
-- 比率调参（`CPENC_SEG_SIZE`、引用层阈值）是实测调出来的经验值，没有理论推导。
+- **The hex layer has a hard gate**: it engages only at ≥90% hex characters,
+  <1% foreign characters, and uniform case. A dump with `0x` prefixes usually
+  does **not** take this path (the `x` counts as a foreign character).
+- **The AVX2 kernel barely shows end to end**: 3.44x on the kernel itself (1MB
+  group, nz=16, 4 bits per symbol), but real data lands 100% on REF2/SEG
+  blocks, where the time goes to reference copies rather than LUT expansion
+  (94MB tar: 524 → 529 MB/s). It is for LUT-shaped blocks, not a general
+  speedup.
+- **Compression is slow**: 4–14 MB/s single-threaded. libcfs spreads that over
+  8MB blocks, and the `cpool` layer adds a thread pool; do not expect
+  single-threaded numbers to compete with gzip on speed.
+- **No encryption, no checksums**: there is no checksum in a block. Damage
+  detection relies on libcfs's `verify` (which re-decodes) or an external
+  tool; the bytes themselves carry no integrity protection.
+- The ratio knobs (`CPENC_SEG_SIZE`, the reference-layer thresholds) are
+  empirical values from measurement, not derived.
 
-## 许可
+## License
 
-GNU General Public License v3.0（`LICENSE`），附一条 **§7(b) 附加条款**（`NOTICE`）：
-版权声明与 "JX-LAB" 署名必须随程序保留，二开须在自己的修改声明之外保留它。
+GNU General Public License v3.0 (`LICENSE`), with one **section 7(b)
+additional term** (`NOTICE`): the copyright notice and the name "JX-LAB" must
+be preserved with the program, and a derived work must keep it alongside the
+notices for its own changes.
 
-与 [libcfs](../libcfs) 同一份许可；两者互相链接，条款必须一致。
+The same license as [libcfs](../libcfs); the two link against each other, so
+the terms have to match.
