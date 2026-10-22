@@ -17,6 +17,8 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 
 #if defined(__x86_64__) && defined(__AVX2__)
 
@@ -27,6 +29,12 @@
    This much slack keeps the call-site guard from ever firing, so the sweep
    below really does run the vector path for every batch. */
 #define PAD    64
+
+static double now_s(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
 
 static uint64_t rng = 0x243F6A8885A308D3ull;
 static uint32_t rnd(void) {
@@ -162,6 +170,33 @@ int main(void) {
                 }
             }
         }
+    }
+
+    /* 3. Throughput.  Correctness is necessary but not sufficient: the
+          kernel has to be worth its dispatch overhead on the shape the
+          callers actually produce (a large group, nz=16, 4 bits a symbol).
+          Compares the full call-site loop, vector path and all. */
+    {
+        size_t gs = 1u << 20;
+        size_t nbytes = (gs * 4 + 7) / 8;
+        uint8_t *big = malloc(nbytes + PAD), *out = malloc(gs);
+        if (big && out) {
+            for (int k = 0; k < 16; k++) lut[k] = (uint8_t)rnd();
+            for (size_t k = 0; k < nbytes + PAD; k++) big[k] = (uint8_t)rnd();
+            double ts = 0, tv = 0;
+            for (int rep = 0; rep < 40; rep++) {
+                double t0 = now_s();
+                decode_group(big, nbytes + PAD, gs, 16, 4, lut, out, 0);
+                double t1 = now_s();
+                decode_group(big, nbytes + PAD, gs, 16, 4, lut, out, 1);
+                ts += t1 - t0;
+                tv += now_s() - t1;
+            }
+            if (ts > 0 && tv > 0)
+                printf("avx2_lut16: 1MB group, scalar %.1f MB/s, avx2 %.1f MB/s (%.2fx)\n",
+                       (double)gs * 40 / ts / 1e6, (double)gs * 40 / tv / 1e6, ts / tv);
+        }
+        free(big); free(out);
     }
 
     printf("avx2_lut_check: %zu cases, %zu mismatches\n", checks, bad);
