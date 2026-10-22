@@ -120,6 +120,32 @@ int main(void) {
         CHK(ok, "200 deterministic recompressions");
     }
 
+    printf("[c6] a record block whose REF2 column segments at 64KB\n");
+    /* Regression for a bound that was too tight: the segmented decoder
+     * rejected a block with more than original_size/512KB segments, but the
+     * encoder drops to 64KB segments for blocks under 1MB, so a ~600KB REF2
+     * column arrived with 9 of them and could not be read back — data that
+     * compressed fine became undecodable.  Record-shaped data (a small pool
+     * of 16-byte keys with a few changing fields) is what produces exactly
+     * that column shape; plain text does not. */
+    {
+        enum { KEYN = 128, REC = 32 };
+        static uint8_t keys[KEYN][16];
+        for (int i = 0; i < KEYN; i++)
+            for (int k = 0; k < 16; k++) keys[i][k] = (uint8_t)(rnd() & 0xFF);
+        size_t n = 5500000;
+        uint8_t *in = malloc(n);
+        ok = in != NULL;
+        for (size_t o = 0; ok && o + REC <= n; ) {
+            memcpy(in + o, keys[rnd() % KEYN], 16); o += 16;
+            uint32_t v = rnd(); memcpy(in + o, &v, 4); o += 4;
+            uint32_t w = rnd(); memcpy(in + o, &w, 4); o += 4;
+            memset(in + o, 0, 8); o += 8;
+        }
+        if (in) { if (ok) ok = rt(in, n); free(in); }
+        CHK(ok, "5.5MB record block (64KB REF2 column segments)");
+    }
+
     printf("\n=== %d failures ===\n", failed);
     return failed ? 1 : 0;
 }

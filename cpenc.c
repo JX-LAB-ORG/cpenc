@@ -2451,11 +2451,15 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         if(sl < CPENC_HEADER_SIZE + 4) return -1;
         uint32_t n_seg = (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
         p += 4;
-        /* The encoder splits at CPENC_SEG_SIZE, so a block cannot hold more
-         * segments than that implies.  The old /4 bound allowed 64M segments
-         * in a 256MB block, and the per-segment job arrays sized from it
-         * were a multi-gigabyte allocation (fuzzing found it at 1.9GB RSS). */
-        uint32_t max_seg = h->original_size / CPENC_SEG_SIZE + 2;
+        /* The encoder splits at CPENC_SEG_SIZE (512KB), except below 1MB,
+         * where it drops to 64KB to keep mixed blocks apart — and CPENC_CHUNK
+         * may lower that to 4KB.  The bound has to be the floor, not the
+         * default: bounding it by 512KB rejected real encoder output (a
+         * 512KB REF2 column arrives as 9 segments, not 1) and made blocks
+         * that had compressed fine impossible to read back.  The old /4
+         * bound was the opposite mistake — 64M segments in a 256MB block,
+         * multi-gigabyte job arrays (fuzzing found that at 1.9GB RSS). */
+        uint32_t max_seg = h->original_size / (4u << 10) + 2;
         if(n_seg < 1 || n_seg > max_seg) return -1;
         if(sl < CPENC_HEADER_SIZE + 4 + (size_t)n_seg * 4) return -1;
         const uint8_t *sp = p + (size_t)n_seg * 4;
