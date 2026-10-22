@@ -1,5 +1,8 @@
 # CPEnc — the block codec behind the Container File System
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23572224.svg)](https://doi.org/10.5281/zenodo.23572224)
+![license](https://img.shields.io/badge/license-GPL--3.0--only-blue)
+
 Compress one block of data into a self-contained CPEnc stream, and get it back
 byte for byte. No container, no filesystem, no daemon: memory in, memory out.
 
