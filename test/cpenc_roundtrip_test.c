@@ -146,6 +146,27 @@ int main(void) {
         CHK(ok, "5.5MB record block (64KB REF2 column segments)");
     }
 
+    printf("[c7] the hex layer keeps the case of a lone nibble\n");
+    /* Odd digit count means the last nibble cannot be paired, so it travels
+     * in the separator table as a character.  That character used to be
+     * emitted lowercase regardless of the block's case, and 257 'A's came
+     * back with the last one as 'a' - silent corruption in the layer whose
+     * whole job is to be lossless.  A round-trip fuzzer found it on the third
+     * execution; no decode-side test could, because the stream is valid. */
+    {
+        static const char hd[] = "0123456789ABCDEF";
+        size_t n = 1016;   /* 1001 digits + 15 newlines */
+        uint8_t *in = malloc(n);
+        size_t k = 0;
+        ok = in != NULL;
+        for (int i = 0; ok && i < 1001; i++) {
+            in[k++] = (uint8_t)hd[rnd() % 16];
+            if (i % 64 == 63) in[k++] = '\n';
+        }
+        if (in) { if (ok) ok = rt(in, k); free(in); }
+        CHK(ok, "1001 uppercase hex digits (lone nibble keeps its case)");
+    }
+
     printf("\n=== %d failures ===\n", failed);
     return failed ? 1 : 0;
 }

@@ -1558,6 +1558,11 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
          * one nibble — mixed case would lose letters on restore) */
         if (hexc * 10 >= sl * 9 && badc * 100 < sl && (hi_upper == 0 || hi_lower == 0)) {
             uint8_t hex_case = hi_upper > 0 ? 1 : 0;
+            /* A lone nibble (odd digit count, or one left before a foreign
+             * char) travels in the separator table as a character, and it
+             * has to carry the block's case: writing it lowercase turned
+             * the last 'A' of 257 of them into 'a' on the way back. */
+            uint8_t hex_lit = (uint8_t)(hex_case ? 'A' : 'a');
             size_t blk = 13 + sl + sl / 2 + 16; /* hdr + table scratch + bin scratch */
             hexbuf = malloc(blk);
             if (hexbuf) {
@@ -1581,7 +1586,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                             uint8_t lb[4]; int ln = 0;
                             do { lb[ln++] = (uint8_t)(p & 0x7F); p >>= 7; if (p) lb[ln - 1] |= 0x80; } while (p);
                             for (int b2 = 0; b2 < ln; b2++) hexbuf[13 + sl + n_sep++] = lb[b2];
-                            hexbuf[13 + sl + n_sep++] = (uint8_t)(pend < 10 ? '0' + pend : 'a' + pend - 10);
+                            hexbuf[13 + sl + n_sep++] = (uint8_t)(pend < 10 ? '0' + pend : hex_lit + pend - 10);
                             pend = -1;
                         }
                         uint32_t p = (uint32_t)v;
@@ -1596,7 +1601,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                     uint8_t lb[4]; int ln = 0;
                     do { lb[ln++] = (uint8_t)(p & 0x7F); p >>= 7; if (p) lb[ln - 1] |= 0x80; } while (p);
                     for (int b2 = 0; b2 < ln; b2++) hexbuf[13 + sl + n_sep++] = lb[b2];
-                    hexbuf[13 + sl + n_sep++] = (uint8_t)(pend < 10 ? '0' + pend : 'a' + pend - 10);
+                    hexbuf[13 + sl + n_sep++] = (uint8_t)(pend < 10 ? '0' + pend : hex_lit + pend - 10);
                 }
                 memmove(hexbuf + 13 + bin_len, hexbuf + 13 + sl, n_sep);  /* table after bin: lag scan sees clean bin */
                 hexbuf[0] = (uint8_t)(orig_len & 0xFF); hexbuf[1] = (uint8_t)((orig_len >> 8) & 0xFF);
