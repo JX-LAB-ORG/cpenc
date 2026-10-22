@@ -121,7 +121,7 @@ project's development environment (PRoot), so the targets use UBSan plus
 ## License
 
 GNU General Public License v3.0 (`LICENSE`), with one **section 7(b)
-additional term** (`NOTICE`): the copyright notice and the name "JX-LAB" must
+additional term** (`NOTICE`): the copyright notice and the name "JXLAB" must
 be preserved with the program, and a derived work must keep it alongside the
 notices for its own changes.
 
