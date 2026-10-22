@@ -1,4 +1,4 @@
-# libcpool — the CPEnc block codec
+# CPEnc — the block codec behind the Container File System
 
 Compress one block of data into a self-contained CPEnc stream, and get it back
 byte for byte. No container, no filesystem, no daemon: memory in, memory out.
