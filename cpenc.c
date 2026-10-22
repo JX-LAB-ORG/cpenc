@@ -14,6 +14,32 @@
 #include "cpenc_avx2.h"
 #endif
 
+
+/* ── Header writes ───────────────────────────────────────────────
+ * The destination is the caller's buffer, and an internal nested block is
+ * not guaranteed to start on a 4-byte boundary: a segmented block written
+ * inside a hex wrapper begins right after the wrapper's one-byte stride
+ * marker.  Writing CPEncHeader fields through a struct pointer there is an
+ * unaligned store — undefined behaviour (UBSan flags it, strict-alignment
+ * targets fault).  These stay byte-wise, mirroring what the decoder already
+ * does with memcpy on the read side. */
+static inline void hdr_head(uint8_t *p, uint8_t stride, uint32_t orig) {
+    p[0] = (uint8_t)(CPENC_MAGIC & 0xFF);
+    p[1] = (uint8_t)(CPENC_MAGIC >> 8);
+    p[2] = (uint8_t)CPENC_VERSION;
+    p[3] = stride;
+    p[4] = (uint8_t)orig; p[5] = (uint8_t)(orig >> 8);
+    p[6] = (uint8_t)(orig >> 16); p[7] = (uint8_t)(orig >> 24);
+}
+static inline void hdr_comp(uint8_t *p, uint32_t comp) {
+    p[8]  = (uint8_t)comp; p[9]  = (uint8_t)(comp >> 8);
+    p[10] = (uint8_t)(comp >> 16); p[11] = (uint8_t)(comp >> 24);
+}
+static inline void hdr_put(uint8_t *p, uint8_t stride, uint32_t orig, uint32_t comp) {
+    hdr_head(p, stride, orig);
+    hdr_comp(p, comp);
+}
+
 #define HUFF_MAX 12
 #define HUFF_WSZ (1<<HUFF_MAX)
 
@@ -1169,11 +1195,7 @@ static size_t ref_try(const uint8_t *s, size_t sl, uint8_t *d, size_t cap,
             if (cpenc_compress_impl(tok, tn, bb + CPENC_HEADER_SIZE, &cl, mo, 1, 1) == 0) {
                 size_t tot = CPENC_HEADER_SIZE + cl;
                 if (tot < base_len && tot <= cap) {
-                    CPEncHeader *bh = (CPEncHeader *)bb;
-                    bh->magic = CPENC_MAGIC; bh->version = CPENC_VERSION;
-                    bh->stride = CPENC_STRIDE_REF;
-                    bh->original_size = (uint32_t)sl;
-                    bh->compressed_size = (uint32_t)cl;
+                    hdr_put((uint8_t *)bb, CPENC_STRIDE_REF, (uint32_t)sl, (uint32_t)cl);
                     memcpy(d, bb, tot);
                     res = tot;
                 }
@@ -1191,11 +1213,7 @@ static size_t ref_try(const uint8_t *s, size_t sl, uint8_t *d, size_t cap,
                 size_t tot = CPENC_HEADER_SIZE + pn;
                 size_t lim = res ? res : base_len;
                 if (tot < lim && tot <= cap) {
-                    CPEncHeader *bh = (CPEncHeader *)d;
-                    bh->magic = CPENC_MAGIC; bh->version = CPENC_VERSION;
-                    bh->stride = CPENC_STRIDE_REF2;
-                    bh->original_size = (uint32_t)sl;
-                    bh->compressed_size = (uint32_t)pn;
+                    hdr_put((uint8_t *)d, CPENC_STRIDE_REF2, (uint32_t)sl, (uint32_t)pn);
                     memcpy(d + CPENC_HEADER_SIZE, pl, pn);
                     res = tot;
                 }
@@ -1481,18 +1499,16 @@ size_t cpenc_max_compressed_size(size_t sl) {
 int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo, int no_bwt, int no_lz) {
     lg2_init();
     const uint8_t *s=(const uint8_t*)sv; uint8_t *d=(uint8_t*)dv;
-    CPEncHeader *h=(CPEncHeader*)d;
     if(*dl<CPENC_HEADER_SIZE) return -1;
     if(sl>0xFFFFFFFFU) return -2;
     mo=mo<0?0:mo>4?4:mo;
-    if(sl==0){memset(h,0,CPENC_HEADER_SIZE);h->magic=CPENC_MAGIC;
-        h->version=CPENC_VERSION;h->stride=CPENC_STRIDE_RAW;*dl=CPENC_HEADER_SIZE;return 0;}
+    if(sl==0){memset(d,0,CPENC_HEADER_SIZE);hdr_put((uint8_t*)d,CPENC_STRIDE_RAW,0,0);
+        *dl=CPENC_HEADER_SIZE;return 0;}
     /* Tiny inputs: the stride/group machinery breaks down (gs can be 0)
      * and compression gains are nil — store RAW, always safe to decode. */
     if(sl<64){
         if(*dl<CPENC_HEADER_SIZE+1+sl) return -1;
-        h->magic=CPENC_MAGIC;h->version=CPENC_VERSION;h->stride=CPENC_STRIDE_RAW;
-        h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(1+sl);
+        hdr_put((uint8_t*)d,CPENC_STRIDE_RAW,(uint32_t)sl,(uint32_t)(1+sl));
         d[CPENC_HEADER_SIZE]=CPENC_LAG_NONE;
         memcpy(d+CPENC_HEADER_SIZE+1,s,sl);*dl=CPENC_HEADER_SIZE+1+sl;return 0;
     }
@@ -1665,9 +1681,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         size_t ext = hex_mode ? 1 : 0;      /* real-stride byte for hex wrapper */
         size_t need = CPENC_HEADER_SIZE + ext + 4 + n_seg * 4;
         if (*dl < need) { free(hexbuf); return -1; }
-        h->magic = CPENC_MAGIC; h->version = CPENC_VERSION;
-        h->stride = hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_SEG;
-        h->original_size = (uint32_t)sl;
+        hdr_head((uint8_t*)d, hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_SEG, (uint32_t)sl);
         uint8_t *op = d + CPENC_HEADER_SIZE;
         if (hex_mode) *op++ = CPENC_STRIDE_SEG;
         *op++ = (uint8_t)(n_seg & 0xFF); *op++ = (uint8_t)((n_seg >> 8) & 0xFF);
@@ -1734,7 +1748,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                 op += clen;
             }
         }
-        h->compressed_size = (uint32_t)(op - d - CPENC_HEADER_SIZE);
+        hdr_comp((uint8_t*)d, (uint32_t)(op - d - CPENC_HEADER_SIZE));
         *dl = (size_t)(op - d);
         /* Match layer runs on the WHOLE block here, not per segment: a
          * segment has no predecessor, so its first record is literals —
@@ -1834,9 +1848,8 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                 size_t r = ref_try(s_bwt, sl, d, *dl, CPENC_HEADER_SIZE+ext+sl, mo);
                 if(r){ *dl=r; free(lagbuf);free(hexbuf); return 0; }
             }
-            h->magic=CPENC_MAGIC;h->version=CPENC_VERSION;
-            h->stride= hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_RAW;
-            h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(ext+sl);
+            hdr_put((uint8_t*)d, hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_RAW,
+                    (uint32_t)sl,(uint32_t)(ext+sl));
             if(hex_mode) d[CPENC_HEADER_SIZE]=CPENC_STRIDE_RAW;
             d[CPENC_HEADER_SIZE+ext-1]=(uint8_t)lag_idx;
             memcpy(d+CPENC_HEADER_SIZE+ext,s,sl);*dl=CPENC_HEADER_SIZE+ext+sl;
@@ -1933,8 +1946,8 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             size_t r = ref_try(s_bwt, sl, d, *dl, CPENC_HEADER_SIZE+ext+sl, mo);
             if(r){ *dl=r; free(trial);free(trans);free(lagbuf);free(hexbuf); return 0; }
         }
-        h->magic=CPENC_MAGIC;h->version=CPENC_VERSION;h->stride= hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_RAW;
-        h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(ext+sl);
+        hdr_put((uint8_t*)d, hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_RAW,
+                (uint32_t)sl,(uint32_t)(ext+sl));
         if(hex_mode) d[CPENC_HEADER_SIZE]=(uint8_t)stride;
         d[CPENC_HEADER_SIZE+ext-1]=(uint8_t)lag_idx;
         memcpy(d+CPENC_HEADER_SIZE+ext,s,sl);*dl=CPENC_HEADER_SIZE+ext+sl;
@@ -2238,7 +2251,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         }
     }
 
-    h->magic=CPENC_MAGIC;h->version=CPENC_VERSION;h->stride= hex_mode ? CPENC_STRIDE_HEX : (uint8_t)stride;
+    hdr_head((uint8_t*)d, hex_mode ? CPENC_STRIDE_HEX : (uint8_t)stride, (uint32_t)sl);
     /* v2: store the stride remainder (tail bytes not covered by any group)
      * so decompress can restore them exactly */
     {
@@ -2322,11 +2335,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                     if (cpenc_compress_impl(bw, sl + 1, bb + CPENC_HEADER_SIZE + 4,
                                             &cl, mo, 1, 1) == 0 &&
                         CPENC_HEADER_SIZE + 4 + cl < main_len) {
-                        CPEncHeader *bh = (CPEncHeader *)bb;
-                        bh->magic = CPENC_MAGIC; bh->version = CPENC_VERSION;
-                        bh->stride = CPENC_STRIDE_BWT;
-                        bh->original_size = (uint32_t)sl;
-                        bh->compressed_size = (uint32_t)(cl + 4);
+                        hdr_put((uint8_t*)bb, CPENC_STRIDE_BWT, (uint32_t)sl, (uint32_t)(cl + 4));
                         bb[CPENC_HEADER_SIZE+0] = (uint8_t)oi;
                         bb[CPENC_HEADER_SIZE+1] = (uint8_t)(oi>>8);
                         bb[CPENC_HEADER_SIZE+2] = (uint8_t)(oi>>16);
@@ -2354,7 +2363,8 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         return 0;
     }
 
-    h->original_size=(uint32_t)sl;h->compressed_size=(uint32_t)(out-(d+CPENC_HEADER_SIZE));
+    hdr_head((uint8_t*)d, hex_mode ? CPENC_STRIDE_HEX : (uint8_t)stride, (uint32_t)sl);
+    hdr_comp((uint8_t*)d, (uint32_t)(out-(d+CPENC_HEADER_SIZE)));
     *dl=(size_t)(out-d); free(trial); free(trans); free(hexbuf); return 0;
 }
 
