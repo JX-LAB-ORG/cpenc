@@ -2509,7 +2509,7 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
                  * stores each sub-block's compressed length.  Its own
                  * header carries original_size, so read it rather than
                  * assuming a fixed granularity. */
-                if (clen < CPENC_HEADER_SIZE) { for (uint32_t j = 0; j < k; j++) free(bufs[j]); free(bufs); free(jobs); return -1; }
+                if (clen < CPENC_HEADER_SIZE) { for (uint32_t j = 0; j < k; j++) free(bufs[j]); free(bufs); free(jobs); free(wants); return -1; }
                 size_t dl_k = (size_t)sp[4] | ((size_t)sp[5] << 8) | ((size_t)sp[6] << 16) | ((size_t)sp[7] << 24);
                 size_t cap = seg_out_cap(sp, dl_k);
                 wants[k] = dl_k;
