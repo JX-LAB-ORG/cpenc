@@ -31,7 +31,7 @@ libcpool_hook.o: libcpool_hook.c cpool.h
 libcpool_hook.so: cpenc.o cpool.o libcpool_hook.o
 	cc $(CFLAGS) -std=gnu11 -shared -fPIC -o $@ $^ -lpthread -ldl
 
-test: cpenc.o cpool.o test/cpenc_test.c test/cpenc_roundtrip_test.c test/cpool_test.c test/cpool_disk_test.c
+test: cpenc.o cpool.o bwt.o test/cpenc_test.c test/cpenc_roundtrip_test.c test/cpool_test.c test/cpool_disk_test.c
 	cc $(CFLAGS) test/cpenc_test.c cpenc.o bwt.o -lm -o test/cpenc_test
 	./test/cpenc_test
 	cc $(CFLAGS) test/cpenc_roundtrip_test.c cpenc.o bwt.o -lm -o test/cpenc_roundtrip_test
