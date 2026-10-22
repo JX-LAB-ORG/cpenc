@@ -167,6 +167,29 @@ int main(void) {
         CHK(ok, "1001 uppercase hex digits (lone nibble keeps its case)");
     }
 
+    printf("[c8] hex text inside a segmented block\n");
+    /* A block over 1MB splits into 512KB segments, and a segment that is hex
+     * text is compressed with the hex layer.  The segment decoder sized its
+     * output from the sub-block's declared size, but for a hex block that is
+     * the folded buffer, not the text — the restore did not fit, and the
+     * whole block could not be read back.  1.5MB of uppercase hex behind
+     * 512KB of random data is the smallest shape that reaches it: the random
+     * part forces segmentation, the hex part fills whole segments. */
+    {
+        static const char hd[] = "0123456789ABCDEF";
+        size_t n = 512 * 1024 + 1600000;
+        uint8_t *in = malloc(n);
+        ok = in != NULL;
+        for (size_t i = 0; ok && i < 512 * 1024; i++) in[i] = (uint8_t)(rnd() & 0xFF);
+        size_t o = 512 * 1024;
+        for (int i = 0; ok && o < n; i++) {
+            in[o++] = (uint8_t)hd[rnd() % 16];
+            if (i % 64 == 63 && o < n) in[o++] = '\n';
+        }
+        if (in) { if (ok) ok = rt(in, n); free(in); }
+        CHK(ok, "1.5MB of hex text inside a segmented block");
+    }
+
     printf("\n=== %d failures ===\n", failed);
     return failed ? 1 : 0;
 }

@@ -307,6 +307,17 @@ static void *seg_pool_worker(void *arg) {
     return NULL;
 }
 typedef struct { const uint8_t *src; size_t clen; uint8_t *out; size_t cap; size_t outlen; int rc; } SegDecJob;
+/* Output capacity for one segment of a segmented block.  The header's
+ * original_size describes what the sub-block decodes to, EXCEPT for a
+ * hex-wrapped one: there the declared size is the folded hex buffer, and the
+ * text it restores to is up to twice as long.  Sizing the buffer from the
+ * declaration alone made every hex segment inside a segmented block
+ * undecodable - the restore did not fit and the length check then failed. */
+static size_t seg_out_cap(const uint8_t *src, size_t declared) {
+    if (src[3] == CPENC_STRIDE_HEX) return 2 * declared + 16;
+    return declared;
+}
+
 static void *seg_dec_worker(void *arg) {
     SegDecJob *j = arg;
     size_t dl = j->cap;
@@ -2490,7 +2501,8 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
             /* parallel decode into per-segment buffers, then assemble */
             uint8_t **bufs = malloc(n_seg * sizeof(uint8_t*));
             SegDecJob *jobs = calloc(n_seg, sizeof(SegDecJob));
-            if (!bufs || !jobs) { free(bufs); free(jobs); return -1; }
+            size_t *wants = calloc(n_seg, sizeof(size_t));
+            if (!bufs || !jobs || !wants) { free(bufs); free(jobs); free(wants); return -1; }
             for (uint32_t k = 0; k < n_seg; k++) {
                 uint32_t clen = (uint32_t)p[k*4] | ((uint32_t)p[k*4+1]<<8) | ((uint32_t)p[k*4+2]<<16) | ((uint32_t)p[k*4+3]<<24);
                 /* Segment sizes are an encoder choice; the stream only
@@ -2499,10 +2511,12 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
                  * assuming a fixed granularity. */
                 if (clen < CPENC_HEADER_SIZE) { for (uint32_t j = 0; j < k; j++) free(bufs[j]); free(bufs); free(jobs); return -1; }
                 size_t dl_k = (size_t)sp[4] | ((size_t)sp[5] << 8) | ((size_t)sp[6] << 16) | ((size_t)sp[7] << 24);
-                bufs[k] = malloc(dl_k ? dl_k : 1);
-                if (!bufs[k]) { for (uint32_t j = 0; j < k; j++) free(bufs[j]); free(bufs); free(jobs); return -1; }
+                size_t cap = seg_out_cap(sp, dl_k);
+                wants[k] = dl_k;
+                bufs[k] = malloc(cap ? cap : 1);
+                if (!bufs[k]) { for (uint32_t j = 0; j < k; j++) free(bufs[j]); free(bufs); free(jobs); free(wants); return -1; }
                 jobs[k].src = sp; jobs[k].clen = clen;
-                jobs[k].out = bufs[k]; jobs[k].cap = dl_k;
+                jobs[k].out = bufs[k]; jobs[k].cap = cap;
                 sp += clen;
             }
             pthread_t th[16];
@@ -2513,19 +2527,20 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
             }
             size_t o = 0;
             for (uint32_t k = 0; k < n_seg; k++) {
-                if (jobs[k].rc != 0 || jobs[k].outlen != jobs[k].cap) {
+                if (jobs[k].rc != 0 || jobs[k].outlen > jobs[k].cap ||
+                    (jobs[k].src[3] != CPENC_STRIDE_HEX && jobs[k].outlen != wants[k])) {
                     for (uint32_t j = 0; j < n_seg; j++) free(bufs[j]);
-                    free(bufs); free(jobs); return -1;
+                    free(bufs); free(jobs); free(wants); return -1;
                 }
                 if ((size_t)*dl < o + jobs[k].outlen) {
                     for (uint32_t j = 0; j < n_seg; j++) free(bufs[j]);
-                    free(bufs); free(jobs); return -1;
+                    free(bufs); free(jobs); free(wants); return -1;
                 }
                 memcpy(d + o, bufs[k], jobs[k].outlen);
                 o += jobs[k].outlen;
             }
             for (uint32_t j = 0; j < n_seg; j++) free(bufs[j]);
-            free(bufs); free(jobs);
+            free(bufs); free(jobs); free(wants);
             *dl = o;
             return 0;
         }
@@ -2533,11 +2548,15 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         for(uint32_t k = 0; k < n_seg; k++) {
             uint32_t clen = (uint32_t)p[k*4] | ((uint32_t)p[k*4+1]<<8) | ((uint32_t)p[k*4+2]<<16) | ((uint32_t)p[k*4+3]<<24);
             size_t dl_k = (size_t)sp[4] | ((size_t)sp[5] << 8) | ((size_t)sp[6] << 16) | ((size_t)sp[7] << 24);
-            if((size_t)*dl < o + dl_k) return -1;
-            size_t hdr_len = dl_k;
-            if(cpenc_decompress(sp, clen, d + o, &dl_k) != 0) return -1;
-            if(dl_k != hdr_len) return -1;
-            o += dl_k;
+            /* decode into the remaining output space: a hex-wrapped segment
+             * restores to more than its declared size */
+            size_t cap = (size_t)*dl - o;
+            if (cap < dl_k) return -1;
+            size_t got = cap;
+            if(cpenc_decompress(sp, clen, d + o, &got) != 0) return -1;
+            if (got < dl_k || got > cap) return -1;
+            if (sp[3] != CPENC_STRIDE_HEX && got != dl_k) return -1;
+            o += got;
             sp += clen;
         }
         *dl = o;
