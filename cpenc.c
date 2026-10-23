@@ -2997,7 +2997,12 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
                 /* huffman sub-block: symbol count lives in the stream header */
                 if(REMAIN(p,edd)<264){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 uint32_t rn=(uint32_t)p[256]|((uint32_t)p[257]<<8)|((uint32_t)p[258]<<16)|((uint32_t)p[259]<<24);
-                if(rn>rb_cap){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                /* Two different bounds: rn counts entries in runs_buf (sized
+                 * rb_cap) and bytes written into scratch (sized gs).  For a
+                 * small group rb_cap is the larger of the two — its +8 slack
+                 * dominates — so checking only rb_cap let h_dec write past
+                 * scratch. */
+                if(rn>rb_cap||rn>gs){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 if(h_dec(&p,edd,scratch,rn)<0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<rn;k++)runs_buf[nr++]=(uint32_t)scratch[k];
             }else if(st==3){
@@ -3008,7 +3013,11 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
                 p+=rl;
             }else if(st==4){
                 uint32_t tlen=0;
-                if(sub5_decode(&p,edd,scratch,rb_cap,&tlen)!=0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                /* Capacity is scratch's gs, not rb_cap: the two differ for
+                 * small groups, and ASan caught the memset in sub5_decode
+                 * writing two bytes past a 4-byte scratch. */
+                if(sub5_decode(&p,edd,scratch,gs,&tlen)!=0){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
+                if(tlen>rb_cap){free(runs_buf);free(vals_buf);free(scratch);if(stride>1)free(trans);return-1;}
                 for(size_t k=0;k<tlen;k++)runs_buf[nr++]=(uint32_t)scratch[k];
             }
             /* vals sub-block */
