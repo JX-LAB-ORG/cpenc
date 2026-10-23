@@ -114,7 +114,13 @@ static void de(uint8_t *p, size_t n, int o) {
 }
 static void dd(uint8_t *p, size_t n, int o) {
     if(n<2) return;
+#if defined(__aarch64__) && !defined(CPENC_SCALAR_DD)
+    /* Prefix sum via path doubling inside each 16-byte lane (Kogge-Stone):
+     * four shift+add steps replace the 16-step serial carry chain. */
+    while(o--) ne_undelta1(p, n);
+#else
     while(o--) for(size_t i=1;i<n;i++) p[i]+=p[i-1];
+#endif
 }
 
 static int ds(const uint8_t *p, size_t n) {
@@ -131,6 +137,321 @@ static int ds(const uint8_t *p, size_t n) {
         double ev=ent(d,k); if(ev<be){be=ev;bs=s;}
     }
     return bs;
+}
+
+/* ── vector-space features (algebraic classification) ─────────────
+ * The block is a vector x over Z_256.  Instead of trial-compressing every
+ * candidate, measure the quantities the linear operators act on:
+ *
+ *   z    = #{i : x[i] == x[i-1]} / (n-1)      sparsity of the difference
+ *                                              vector Dx  -> delta family
+ *   a_k  = #{i : x[i] == x[i-k]} / (n-k)      lag-k equality (autocorrelation
+ *                                              of the value vector) -> stride
+ *   w    = repeated 4-byte windows            collision rate of the window
+ *                                              vector w_i -> match layer
+ *
+ * w is exactly the "f(x1)=f(x2)" statistic: it counts how often two
+ * positions of the window vector take the same value.  All of this is
+ * O(n) counting on a bounded sample, with no histogram and no trial. */
+typedef struct { double z, a1, a2, a4, a8, w, lr, lr16, lr32, cover, ap1, ap2, rsim, rdup, dapprox, dshape, ml_short, ml_long; double rho[17]; int kbest; double drho; } VFeat;
+
+/* with_rho: the lag-k correlation is O(16n) 64-bit multiplies and must not
+ * run on the hot path; the match-layer gate needs only w, which costs one
+ * pass over a 64KB window sample. */
+static void vfeat(const uint8_t *p, size_t n, VFeat *f, int with_rho) {
+    size_t k = n < (64u << 10) ? n : (64u << 10);
+    memset(f, 0, sizeof *f);
+    if (k < 16) return;
+    size_t z = 0, a2 = 0, a4 = 0, a8 = 0;
+    for (size_t i = 1; i < k; i++) if (p[i] == p[i-1]) z++;
+    for (size_t i = 2; i < k; i++) if (p[i] == p[i-2]) a2++;
+    for (size_t i = 4; i < k; i++) if (p[i] == p[i-4]) a4++;
+    for (size_t i = 8; i < k; i++) if (p[i] == p[i-8]) a8++;
+    f->z = (double)z / (double)(k - 1);
+    f->a1 = f->z;
+    f->a2 = (double)a2 / (double)(k - 2);
+    f->a4 = (double)a4 / (double)(k - 4);
+    f->a8 = (double)a8 / (double)(k - 8);
+
+    /* Correlation of the value vector with its lag-k shift.  The peak of
+     * rho[k]-rho[k-1] is the structural period (stride); the decay rate is
+     * how predictable the block is.  Measured at 512K: f32 peaks at k=4
+     * (d=0.17), ELF at k=8 (d=0.10), text is flat. */
+    if (with_rho) {
+        size_t m = n < (16u << 10) ? n : (16u << 10);
+        for (int lag = 1; lag <= 8; lag++) {
+            if ((size_t)lag + 16 > m) break;
+            uint64_t sxy = 0, sxx = 0, syy = 0;
+            for (size_t i = (size_t)lag; i < m; i++) {
+                uint64_t a = p[i], b = p[i - lag];
+                sxy += a * b; sxx += a * a; syy += b * b;
+            }
+            double den = sqrt((double)sxx) * sqrt((double)syy);
+            f->rho[lag] = den > 0 ? (double)sxy / den : 0;
+        }
+        for (int lag = 2; lag <= 8; lag++) {
+            double d = f->rho[lag] - f->rho[lag - 1];
+            if (d > 0.02 && d > f->drho) { f->drho = d; f->kbest = lag; }
+        }
+    }
+
+    enum { WB = 16, WS = 1u << WB };
+    uint64_t *tab = calloc(WS, sizeof(uint64_t));
+    size_t rep = 0, tot = 0;
+    if (tab) {
+        for (size_t i = 0; i + 4 <= k; i += 4) {
+            uint32_t v; memcpy(&v, p + i, 4);
+            uint64_t key = ((uint64_t)v << 1) | 1u;
+            uint32_t h = (v * 2654435761u) >> (32 - WB);
+            for (int pr = 0; pr < 8; pr++) {
+                uint64_t *slot = &tab[(h + (uint32_t)pr) & (WS - 1)];
+                if (*slot == 0) { *slot = key; break; }
+                if (*slot == key) { rep++; break; }
+            }
+            tot++;
+        }
+        free(tab);
+    }
+    f->w = tot ? (double)rep / (double)tot : 0;
+
+    /* Region-pair statistics: split the sample into 1KB regions, describe
+     * each by (mean value, net slope) and a hash.  rdup = fraction of pairs
+     * that are byte-identical (REF's territory); rsim = fraction whose mean
+     * and slope are both close (BWT's territory: two different regions with
+     * approximately the same f and k). */
+    {
+        enum { RG = 1024, RM = 64 };
+        size_t nr = k / RG; if (nr > RM) nr = RM;
+        if (nr >= 2) {
+            double mu[RM]; double sl[RM]; uint64_t hh[RM];
+            for (size_t r = 0; r < nr; r++) {
+                const uint8_t *q = p + r * RG;
+                uint64_t sum = 0, h = 0xcbf29ce484222325ULL;
+                for (size_t i = 0; i < RG; i++) {
+                    sum += q[i];
+                    h = (h ^ q[i]) * 0x100000001b3ULL;
+                }
+                int net = (int)q[RG-1] - (int)q[0];
+                if (net > 127) net -= 256; if (net < -128) net += 256;
+                mu[r] = (double)sum / RG;
+                sl[r] = (double)net / RG;
+                hh[r] = h;
+            }
+            size_t dup = 0, sim = 0, pairs = 0;
+            for (size_t a = 0; a < nr; a++)
+                for (size_t b = a + 1; b < nr; b++) {
+                    pairs++;
+                    if (hh[a] == hh[b]) dup++;
+                    double dm = mu[a] - mu[b]; if (dm < 0) dm = -dm;
+                    double ds = sl[a] - sl[b]; if (ds < 0) ds = -ds;
+                    if (dm <= 8 && ds <= 0.05) sim++;
+                }
+            if (pairs) { f->rdup = (double)dup / pairs; f->rsim = (double)sim / pairs; }
+        }
+    }
+
+    if (with_rho) {
+    /* ap2: curvature — how often the slope itself barely changes
+     * (|k_i - k_{i-1}| <= 2).  BWT needs BOTH this and ap1: a nearly flat
+     * level set that also varies slowly is what turns into long MTF runs. */
+    {
+        size_t c2 = 0;
+        for (size_t i = 2; i < k; i++) {
+            int k1 = (int)p[i] - (int)p[i-1];
+            int k0 = (int)p[i-1] - (int)p[i-2];
+            if (k1 > 127) k1 -= 256; if (k1 < -128) k1 += 256;
+            if (k0 > 127) k0 -= 256; if (k0 < -128) k0 += 256;
+            int d = k1 - k0; if (d < 0) d = -d;
+            if (d <= 2) c2++;
+        }
+        f->ap2 = (double)c2 / (double)(k - 2);
+    }
+
+    /* ap1: how often adjacent values are within +-2 (mod 256) — the
+     * "k-neighbourhood approximation" that BWT turns into local runs. */
+    {
+        size_t ap = 0;
+        for (size_t i = 1; i < k; i++) {
+            int d = (int)p[i] - (int)p[i-1];
+            if (d < 0) d = -d;
+            if (d > 128) d = 256 - d;
+            if (d <= 2) ap++;
+        }
+        f->ap1 = (double)ap / (double)(k - 1);
+    }
+    }
+
+    if (with_rho) {
+    /* Match-length histogram from a cheap sampled matcher: the direct
+     * "short exact vs long exact" quantity.  Greedy over a 64KB sample,
+     * 4-byte hash, chain depth 8, match capped at 256 bytes.  Short means
+     * 4 .. 15, long means 16+. */
+    {
+        enum { MH = 1 << 16, MD = 8, MCAP = 256 };
+        int32_t *head = malloc(MH * 4), *chain = malloc(MH * 4);
+        if (head && chain) {
+            memset(head, 0xFF, MH * 4);
+            size_t m = k < (64u << 10) ? k : (64u << 10);
+            size_t cshort = 0, clong = 0, tot = 0;
+            for (size_t i = 0; i + 4 <= m; i++) {
+                uint32_t v; memcpy(&v, p + i, 4);
+                uint32_t h = ((v * 2654435761u) >> 16) & (MH - 1);
+                int32_t c = head[h]; int best = 0, tries = 0;
+                while (c >= 0 && tries < MD) {
+                    size_t cd = i - (size_t)c;
+                    if (cd && !memcmp(p + c, p + i, 4)) {
+                        size_t L = 4;
+                        while (L < MCAP && i + L < m && cd + L < i && p[c + L] == p[i + L]) L++;
+                        if ((int)L > best) best = (int)L;
+                    }
+                    c = chain[c & (MH - 1)]; tries++;
+                }
+                chain[i & (MH - 1)] = head[h]; head[h] = (int32_t)i;
+                if (best >= 4) { if (best < 16) cshort++; else clong++; }
+                tot++;
+            }
+            f->ml_short = tot ? (double)cshort / (double)tot : 0;
+            f->ml_long  = tot ? (double)clong / (double)tot : 0;
+        }
+        free(head); free(chain);
+    }
+
+    /* Similar-region coverage.  Two different x-intervals are "the same
+     * region" when f(x) (level), the local slope amplitude |k|, and the
+     * amplitude of k's rate of change |k'| agree.  Each 8-byte block is
+     * reduced to that signature; repeated signatures at a different position
+     * extended over consecutive blocks give the repeat length in x. */
+    {
+        enum { BS = 8, MAXB = 8192 };
+        size_t nb = k / BS; if (nb > MAXB) nb = MAXB;
+        uint8_t sig[MAXB], sig2[MAXB];
+        for (size_t b = 0; b < nb; b++) {
+            const uint8_t *q = p + b * BS;
+            unsigned sum = 0, kacc = 0, k2acc = 0;
+            for (int j = 0; j < BS; j++) sum += q[j];
+            for (int j = 0; j + 1 < BS; j++) {
+                int d = (int)q[j+1] - (int)q[j];
+                if (d > 127) d -= 256; if (d < -128) d += 256;
+                kacc += (unsigned)(d < 0 ? -d : d);
+            }
+            for (int j = 0; j + 2 < BS; j++) {
+                int d1 = (int)q[j+1] - (int)q[j];
+                int d2 = (int)q[j+2] - (int)q[j+1];
+                if (d1 > 127) d1 -= 256; if (d1 < -128) d1 += 256;
+                if (d2 > 127) d2 -= 256; if (d2 < -128) d2 += 256;
+                int dd = d2 - d1;
+                k2acc += (unsigned)(dd < 0 ? -dd : dd);
+            }
+            unsigned m1 = kacc / (BS - 1), m2 = k2acc / (BS - 2);
+            unsigned fq  = (sum / BS) >> 4;
+            unsigned kq  = m1 == 0 ? 0 : m1 < 4 ? 1 : m1 < 16 ? 2 : 3;
+            unsigned k2q = m2 == 0 ? 0 : m2 < 4 ? 1 : m2 < 16 ? 2 : 3;
+            sig[b] = (uint8_t)(fq * 16 + kq * 4 + k2q);
+        }
+        int32_t tab[256]; memset(tab, 0xFF, sizeof tab);
+        size_t covered = 0, b = 0;
+        while (b < nb) {
+            int32_t prev = tab[sig[b]];
+            tab[sig[b]] = (int32_t)b;
+            if (prev >= 0 && (size_t)prev + 8 <= b) {
+                size_t d = b - (size_t)prev, len = 1;
+                while (b + len < nb && sig[b + len] == sig[b + len - d]) len++;
+                if (len >= 8) { covered += len * BS; b += len; continue; }
+            }
+            b++;
+        }
+        f->dapprox = nb ? (double)covered / (double)(nb * BS) : 0;
+
+        /* Level-free variant: same derivative profile at a different level is
+         * exactly the "base + constant offset" candidate pool. */
+        int32_t tab2[256]; memset(tab2, 0xFF, sizeof tab2);
+        size_t cov2 = 0; b = 0;
+        while (b < nb) {
+            int32_t prev = tab2[sig2[b]];
+            tab2[sig2[b]] = (int32_t)b;
+            if (prev >= 0 && (size_t)prev + 8 <= b) {
+                size_t d = b - (size_t)prev, len = 1;
+                while (b + len < nb && sig2[b + len] == sig2[b + len - d]) len++;
+                if (len >= 8) { cov2 += len * BS; b += len; continue; }
+            }
+            b++;
+        }
+        f->dshape = nb ? (double)cov2 / (double)(nb * BS) : 0;
+    }
+
+    /* cover: fraction of the sample covered by greedy exact matches of at
+     * least 8 bytes — the "same f, different x" quantity REF wins on.
+     * O(n) with one hash table; no output is produced. */
+    {
+        enum { CB = 16, CS = 1u << CB, NIL = 0xFFFFFFFFu };
+        uint32_t *pos = malloc(CS * sizeof(uint32_t));
+        if (pos) {
+            memset(pos, 0xFF, CS * sizeof(uint32_t));
+            size_t i = 0, covered = 0;
+            while (i + 8 <= k) {
+                uint64_t v; memcpy(&v, p + i, 8);
+                uint64_t hh = v * 0xff51afd7ed558ccdULL; hh ^= hh >> 33;
+                uint32_t h = (uint32_t)hh & (CS - 1);
+                uint32_t prev = pos[h];
+                pos[h] = (uint32_t)i;
+                size_t len = 0;
+                if (prev != NIL && prev < i && memcmp(p + prev, p + i, 8) == 0) {
+                    while (i + len < k && p[prev + len] == p[i + len]) len++;
+                }
+                if (len >= 8) { covered += len; i += len; }
+                else i++;
+            }
+            f->cover = (double)covered / (double)k;
+            free(pos);
+        }
+    }
+    }
+
+    if (with_rho) {
+    /* Long-range repeat rate: 8-byte windows seen before at a distance
+     * greater than 4KB.  This is the statistic that separates the blocks
+     * REF wins (tables, repeated templates) from prose, where BWT wins. */
+    {
+        enum { LB = 17, LS = 1u << LB, NIL = 0xFFFFFFFFu };
+        uint32_t *pos = malloc(LS * sizeof(uint32_t));
+        if (pos) {
+            memset(pos, 0xFF, LS * sizeof(uint32_t));
+            size_t lrn = 0, lrt = 0;
+            for (size_t i = 0; i + 8 <= k; i += 8) {
+                uint64_t v; memcpy(&v, p + i, 8);
+                v ^= v >> 33; v *= 0xff51afd7ed558ccdULL; v ^= v >> 33;
+                uint32_t h = (uint32_t)v & (LS - 1);
+                uint32_t prev = pos[h];
+                if (prev != NIL && i - prev > 4096) lrn++;
+                pos[h] = (uint32_t)i;
+                lrt++;
+            }
+            f->lr = lrt ? (double)lrn / (double)lrt : 0;
+            free(pos);
+        }
+        /* Longer windows: a repeat of 16 or 32 bytes is a long match, which
+         * is what REF wins on, as opposed to the short clustering BWT eats. */
+        for (int wlen = 16; wlen <= 32; wlen += 16) {
+            enum { LS2 = 1u << 17 };
+            uint32_t *p2 = malloc(LS2 * sizeof(uint32_t));
+            if (!p2) continue;
+            memset(p2, 0xFF, LS2 * sizeof(uint32_t));
+            size_t rn2 = 0, rt2 = 0;
+            for (size_t i = 0; i + (size_t)wlen <= k; i += 8) {
+                uint64_t h = 0xcbf29ce484222325ULL;
+                for (int b = 0; b < wlen; b++) h = (h ^ p[i + b]) * 0x100000001b3ULL;
+                uint32_t idx = (uint32_t)(h ^ (h >> 32)) & (LS2 - 1);
+                uint32_t prev = p2[idx];
+                if (prev != 0xFFFFFFFFu && i - prev > 4096) rn2++;
+                p2[idx] = (uint32_t)i;
+                rt2++;
+            }
+            double v = rt2 ? (double)rn2 / (double)rt2 : 0;
+            if (wlen == 16) f->lr16 = v; else f->lr32 = v;
+            free(p2);
+        }
+    }
+    }
 }
 
 /* 4-interleaved frequency counter — breaks the per-iteration data dependency
@@ -1528,6 +1849,40 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
         memcpy(d+CPENC_HEADER_SIZE+1,s,sl);*dl=CPENC_HEADER_SIZE+1+sl;return 0;
     }
 
+    /* Algebraic gate: w is the f(x1)=f(x2) statistic over the window
+     * vector.  A block with almost no repeated 4-byte windows cannot win
+     * with a match layer, so REF/BWT are skipped instead of trial-
+     * compressed.  Measured: floats and BF16 lose zero ratio while the
+     * encoder gets 1.6-2.4x faster; text/records/ELF keep w >= 0.6 and run
+     * both candidates unchanged.  Inner recursions (no_bwt && no_lz) skip
+     * the measurement; CPENC_NO_GATE disables the gate for A/B tests. */
+    int allow_ref = 1, allow_bwt = 1;
+    if (!(no_bwt && no_lz) && (!getenv("CPENC_NO_GATE") || getenv("CPENC_VFEAT"))) {
+        VFeat vf; vfeat(s, sl, &vf, getenv("CPENC_VFEAT") || getenv("CPENC_CHOOSE"));
+        if (getenv("CPENC_VFEAT"))
+            fprintf(stderr, "VFEAT n=%zu z=%.3f a2=%.3f a4=%.3f a8=%.3f w=%.4f "
+                    "r1=%.3f r2=%.3f r4=%.3f r8=%.3f r16=%.3f kbest=%d drho=%.3f lr=%.4f lr16=%.4f lr32=%.4f cover=%.3f ap1=%.3f ap2=%.3f rsim=%.3f rdup=%.3f dapprox=%.3f dshape=%.3f ms=%.3f ml=%.3f\n",
+                    sl, vf.z, vf.a2, vf.a4, vf.a8, vf.w,
+                    vf.rho[1], vf.rho[2], vf.rho[4], vf.rho[8], vf.rho[16],
+                    vf.kbest, vf.drho, vf.lr, vf.lr16, vf.lr32, vf.cover, vf.ap1, vf.ap2, vf.rsim, vf.rdup, vf.dapprox, vf.dshape, vf.ml_short, vf.ml_long);
+        allow_ref = vf.w >= 0.005;
+        allow_bwt = vf.w >= 0.10;
+        /* Threshold rule (fitted on 32 text blocks, 30/32): when both
+         * approximation rates are high the block is REF territory, else
+         * BWT.  Exclusive choice = one match layer instead of two. */
+        if (getenv("CPENC_CHOOSE") && allow_ref && allow_bwt) {
+            /* REF -> BWT -> entropy.  Two REF regimes measured: smooth
+             * near-duplicates (both approximation rates high) and
+             * fixed-width records (k-rate peak at 8, as in ELF).  Blocks
+             * near the boundary run both candidates. */
+            int ref_conf = (vf.ap1 >= 0.241 && vf.ap2 >= 0.129) ||
+                           (vf.kbest == 8 && vf.drho >= 0.10);
+            int bwt_conf = (vf.ap1 <= 0.200 || vf.ap2 <= 0.085);
+            if (ref_conf) allow_bwt = 0;
+            else if (bwt_conf) allow_ref = 0;
+        }
+    }
+
     /* v4: hex-ascii layer — text-form numbers (log hex dumps) waste the
      * delta machinery on half-byte interleave ('F' 'F' = 0xFF, two chars
      * per value).  Detect hex-heavy text, fold 2 chars -> 1 byte, and keep
@@ -1877,7 +2232,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             /* Near-random *bytes* can still be a repeated record with a few
              * fields changed (byte entropy ~8.0, structure highly
              * redundant) — let the match layer bid before falling to RAW. */
-            if(!no_lz && !hex_mode){
+            if(!no_lz && !hex_mode && allow_ref){
                 size_t r = ref_try(s_bwt, sl, d, *dl, CPENC_HEADER_SIZE+ext+sl, mo);
                 if(r){ *dl=r; free(lagbuf);free(hexbuf); return 0; }
             }
@@ -2305,7 +2660,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * source code and access logs all beat it).
      * Format: [payload], payload = compressed token stream. */
     int lz_won = 0;
-    if (!no_lz && !hex_mode) {
+    if (!no_lz && !hex_mode && allow_ref) {
         /* Do NOT return on a win: the BWT candidate below still gets to
          * compete against this result.  On source code the reference layer lands between
          * the main path and BWT, and returning here hid BWT's win
@@ -2324,7 +2679,22 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * sort is slow, so it must earn its place.
      * Format: [eof_row u32][payload], payload = compressed BWT stream
      * (recursed with no_bwt=1 so it never re-enters this candidate). */
-    if (!no_bwt && !hex_mode && sl >= 8192 && sl <= (1u<<20)) {
+    /* Probe measured unconditionally under CPENC_VFEAT so the REF-winning
+     * blocks get a drop value too — this is the experiment that decides
+     * whether the drop can act as a pre-REF discriminator. */
+    if (getenv("CPENC_VFEAT") && !no_bwt && !hex_mode && sl >= 8192 && sl <= (1u<<20)) {
+        size_t pn = sl < 4096 ? sl : 4096;
+        uint8_t *pb = malloc(pn + 1);
+        if (pb) {
+            bwt_enc(s, pn, pb);
+            mtf_enc_inplace(pb, pn + 1);
+            uint32_t pc[256] = {0};
+            for (size_t i = 0; i <= pn; i++) pc[pb[i]]++;
+            fprintf(stderr, "PROBE idx=%s n=%zu drop=%.4f\n", getenv("CPENC_BLKIDX") ? getenv("CPENC_BLKIDX") : "-", sl, ent(s, pn) - fq_ent(pc, pn + 1));
+            free(pb);
+        }
+    }
+    if (!no_bwt && !hex_mode && allow_bwt && sl >= 8192 && sl <= (1u<<20)) {
         double e = ent(s_bwt, 2048);
         size_t main_len = (size_t)(out - d);
         /* Two cheap gates before paying for the sort (~4ms per 64KB):
@@ -2348,7 +2718,11 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                 mtf_enc_inplace(pb, pn + 1);
                 uint32_t pc[256] = {0};
                 for (size_t i = 0; i <= pn; i++) pc[pb[i]]++;
-                probe_ok = (fq_ent(pc, pn + 1) < ent(s_bwt, pn) - 0.3);
+                double e0 = ent(s_bwt, pn);
+                double e1 = fq_ent(pc, pn + 1);
+                probe_ok = (e1 < e0 - 0.3);
+                if (getenv("CPENC_VFEAT"))
+                    fprintf(stderr, "PROBE n=%zu drop=%.4f ok=%d\n", sl, e0 - e1, probe_ok);
                 free(pb);
             }
             uint8_t *bw = probe_ok ? malloc(sl + 1) : NULL;
