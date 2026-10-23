@@ -203,7 +203,7 @@ int main(void) {
         static const char hd[] = "0123456789ABCDEF";
         ok = in != NULL;
         for (size_t o = 0; ok && o < n; ) {
-            for (int i = 0; i < 9; i++) in[o++] = (uint8_t)hd[rnd() % 16];
+            for (int i = 0; i < 9 && o < n; i++) in[o++] = (uint8_t)hd[rnd() % 16];
             if (o < n) in[o++] = '\n';
         }
         if (in) { if (ok) ok = rt(in, n); free(in); }
