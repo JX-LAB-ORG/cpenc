@@ -77,11 +77,11 @@ static void emit_bwt_small_cap(const char *dir) {
         return;
     }
     memcpy(&h, c, sizeof h);
-    if (h.stride != CPENC_STRIDE_BWT) {
+    if (h.stride != CPENC_STRIDE_BWT && h.stride != CPENC_STRIDE_BWT2) {
         /* Force-BWT failed: say so rather than writing a seed that misses
          * the branch.  (Not expected with this text; order 4 is the next
          * knob if a future encoder gate rejects order 2.) */
-        fprintf(stderr, "bwt-small-cap: encoder picked stride 0x%02X, not 0xFC; seed not written\n",
+        fprintf(stderr, "bwt-small-cap: encoder picked stride 0x%02X, not a BWT stride; seed not written\n",
                 h.stride);
         free(src); free(c);
         return;

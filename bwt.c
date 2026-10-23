@@ -206,3 +206,133 @@ int bwt_dec(const uint8_t *b, size_t n1, size_t eof_row, uint8_t *out) {
     free(lf);
     return 0;
 }
+
+/* ── anchored LF walk (v7 BWT2) ─────────────────────────────────
+ * Serial decode is one dependent load per output byte.  The same LF
+ * permutation is a cycle; start k chains at stored positions and the
+ * loads of the k chains are independent, so one core can have several
+ * cache misses in flight.
+ *
+ * The LF build below is deliberately the same construction as bwt_dec's:
+ * cnt[] minus the EOF occurrence, start[] as the F column, lf[i] = the F
+ * position of the i-th L character (the EOF row maps to F[0]).  It is
+ * repeated here rather than factored out so the v6 (stride 0xFC) path
+ * stays byte-for-byte the behaviour it shipped with.
+ */
+static uint32_t *bwt_lf_build(const uint8_t *b, size_t n1, size_t eof_row) {
+    if (n1 == 0 || eof_row >= n1) return NULL;
+    /* The histogram is four interleaved counters: `cnt[b[i]]++` has a
+     * loop-carried dependency through the counter it touches, and four
+     * independent tables (4KB of stack, L1-resident) let the core issue
+     * four increments per cycle instead.  Measured 2.88 -> 2.03 ms/MB,
+     * which matters because every BWT2 decode pays this. */
+    uint32_t cnt[4][256];
+    memset(cnt, 0, sizeof cnt);
+    size_t i = 0;
+    for (; i + 4 <= n1; i += 4) {
+        cnt[0][b[i]]++; cnt[1][b[i + 1]]++;
+        cnt[2][b[i + 2]]++; cnt[3][b[i + 3]]++;
+    }
+    for (; i < n1; i++) cnt[0][b[i]]++;
+    for (int c = 1; c < 4; c++)
+        for (int k = 0; k < 256; k++) cnt[0][k] += cnt[c][k];
+    cnt[0][b[eof_row]]--;                     /* sentinel is not a character */
+    uint32_t start[256];
+    uint32_t sum = 0;
+    for (int i = 0; i < 256; i++) { start[i] = sum; sum += cnt[0][i]; }
+    uint32_t *lf = malloc(n1 * sizeof(uint32_t));
+    if (!lf) return NULL;
+    uint32_t cpos[256];
+    memcpy(cpos, start, sizeof(cpos));
+    /* Range-check each value where it is produced: this is the proof the
+     * chain walk relies on, and a branch here is independent of the walk's
+     * dependent loads.  (The values cannot actually exceed n1-1 for a table
+     * this function built — the check exists so that a future change here
+     * fails closed instead of walking outside the block.) */
+    for (i = 0; i < eof_row; i++) {
+        lf[i] = 1 + cpos[b[i]]++;
+        if (lf[i] >= n1) { free(lf); return NULL; }
+    }
+    lf[eof_row] = 0;                          /* F[0] = sentinel */
+    for (i = eof_row + 1; i < n1; i++) {
+        lf[i] = 1 + cpos[b[i]]++;
+        if (lf[i] >= n1) { free(lf); return NULL; }
+    }
+    return lf;
+}
+
+int bwt_make_anchors(const uint8_t *bwt, size_t n1, size_t orig_idx,
+                     uint32_t *anchors, int k) {
+    if (k < 1 || n1 == 0 || orig_idx >= n1) return -1;
+    uint32_t *lf = bwt_lf_build(bwt, n1, orig_idx);
+    if (!lf) return -1;
+    size_t m = n1 / (size_t)k;
+    size_t pos = 0;
+    int rc = 0;
+    for (int j = 0; j < k; j++) {
+        anchors[j] = (uint32_t)pos;
+        for (size_t t = 0; t < m; t++) {
+            pos = lf[pos];
+            /* A valid BWT cannot leave the block (the LF values are F
+             * positions), but the walk is cheap to guard. */
+            if (pos >= n1) { rc = -1; goto done; }
+        }
+    }
+done:
+    free(lf);
+    return rc;
+}
+
+int bwt_dec_anchors(const uint8_t *bwt, size_t n1, size_t orig_idx,
+                    const uint32_t *anchors, int k, uint8_t *out) {
+    if (n1 == 0 || orig_idx >= n1) return -1;
+    if (k < 8 || k > 16) return -1;              /* the v7 format's range */
+    if (n1 < (size_t)k) return -1;               /* k distinct positions */
+    /* The cycle starts at 0.  The other anchors are j*m LF steps along it,
+     * so they are in-range but *not* ordered: the LF permutation jumps
+     * around the block.  What must hold is that they are pairwise distinct;
+     * a duplicate would make two chains start on the same cycle position,
+     * which is a corrupt table even though each write stays in its own
+     * output range. */
+    if (anchors[0] != 0) return -1;
+    for (int j = 0; j < k; j++) {
+        if (anchors[j] >= n1) return -1;
+        for (int i = 0; i < j; i++)
+            if (anchors[j] == anchors[i]) return -1;
+    }
+    uint32_t *lf = bwt_lf_build(bwt, n1, orig_idx);
+    if (!lf) return -1;
+    /* bwt_lf_build proved every value in range as it wrote it, so no step
+     * below can leave the block and the walk needs no per-step check: that
+     * check sat on the dependency chain (each chain's next load would wait
+     * for the previous comparison) and halved the walk's speed.  Together
+     * with the anchor validation above, every step of every chain is in
+     * bounds. */
+    size_t m = n1 / (size_t)k;
+    size_t rem = n1 - m * (size_t)k;             /* the last chain takes it */
+    uint32_t a[16];
+    uint8_t *op[16];
+    memcpy(a, anchors, (size_t)k * sizeof(uint32_t));
+    for (int j = 0; j < k; j++)
+        op[j] = out + (n1 - 1 - (size_t)j * m);  /* each chain runs downward */
+    for (size_t t = 0; t < m; t++) {
+        for (int j = 0; j < k; j++) {
+            uint32_t ps = a[j];
+            *op[j]-- = bwt[ps];
+            a[j] = lf[ps];
+        }
+    }
+    {
+        /* Chain k-1's anchored start covered steps [0,m); op[k-1] now points
+         * at the byte before that range, so it continues through the
+         * remainder and every output byte is written once. */
+        uint8_t *q = op[k - 1];
+        uint32_t ps = a[k - 1];
+        for (size_t t = m; t < m + rem; t++) {
+            *q-- = bwt[ps];
+            ps = lf[ps];
+        }
+    }
+    free(lf);
+    return 0;
+}

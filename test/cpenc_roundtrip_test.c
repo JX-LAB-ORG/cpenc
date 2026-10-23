@@ -2,6 +2,7 @@
  * always reproduce the input exactly.  Covers sizes from 1B to 16MB,
  * special data patterns, and thousands of random payloads. */
 #include "../cpenc.h"
+#include "../bwt.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -208,6 +209,105 @@ int main(void) {
         }
         if (in) { if (ok) ok = rt(in, n); free(in); }
         CHK(ok, "9 hex digits per line round-trips");
+    }
+
+    printf("[c10] v7 BWT2: anchored LF chains + RLE2 round-trip\n");
+    /* Stride 0xF9 is the BWT candidate the encoder now emits: BWT, k stored
+     * LF anchors, MTF, RLE2, then the inner Huffman block.  Source-like text
+     * with a wide identifier vocabulary is the shape that picks BWT (the
+     * reference layers lose on it); the same generator as the capacity
+     * test.  Two sizes matter: <=512K must store k=8 anchors, >512K k=16. */
+    {
+        static const char *syl[] = {
+            "ka","to","ri","men","sa","lo","vin","dra","pe","qu",
+            "an","el","or","ist","ure","con","ter","pre","dis","tion"
+        };
+        ok = 1;
+        size_t sizes[2] = { 65536, 700000 };
+        for (int si = 0; si < 2 && ok; si++) {
+            size_t n = sizes[si];
+            uint8_t *in = malloc(n);
+            if (!in) { ok = 0; break; }
+            /* A fixed stream per size, independent of what c1..c9 consumed:
+             * the content decides whether RLE2's stream or MTF wins by a
+             * hair, and this text was chosen to make BWT2 win at both. */
+            rng_state = 0xC0FFEE;
+            size_t o = 0;
+            while (o < n) {
+                char name[64], line[160];
+                size_t k = 0;
+                for (int w = 0; w < 3 && k < sizeof name - 8; w++) {
+                    const char *s = syl[rnd() % 20];
+                    while (*s && k < sizeof name - 1) name[k++] = *s++;
+                }
+                name[k] = 0;
+                for (char *p = name; *p; p++) if (rnd() & 1) *p = (char)(*p - 'a' + 'A');
+                int len = snprintf(line, sizeof line, "#define %s %lu\n",
+                                   name, (unsigned long)(rnd() % 99999));
+                size_t take = (size_t)len;
+                if (take > n - o) take = n - o;
+                memcpy(in + o, line, take);
+                o += take;
+            }
+            /* order 2, the same call the rest of this file makes */
+            size_t mc = cpenc_max_compressed_size(n);
+            uint8_t *c = malloc(mc), *out = malloc(n);
+            size_t cl = mc;
+            if (!c || !out || cpenc_compress(in, n, c, &cl, 2) != 0) {
+                ok = 0;
+            } else if (c[3] != CPENC_STRIDE_BWT2) {
+                fprintf(stderr, "  FAIL: n=%zu picked stride 0x%02X, not BWT2\n",
+                        n, c[3]);
+                ok = 0;
+            } else {
+                size_t want_k = n <= (512u << 10) ? 8 : 16;
+                if (c[CPENC_HEADER_SIZE] != want_k) {
+                    fprintf(stderr, "  FAIL: n=%zu stored k=%u, want %zu\n",
+                            n, c[CPENC_HEADER_SIZE], want_k);
+                    ok = 0;
+                }
+                size_t dl = n;
+                if (ok && (cpenc_decompress(c, cl, out, &dl) != 0 ||
+                           dl != n || memcmp(out, in, n))) {
+                    fprintf(stderr, "  FAIL: n=%zu BWT2 round-trip\n", n);
+                    ok = 0;
+                }
+            }
+            free(in); free(c); free(out);
+        }
+        CHK(ok, "BWT2 blocks at 64KB (k=8) and 700KB (k=16)");
+
+        /* The chain walk itself, independent of which layer the encoder
+         * picks: k chains must reproduce bwt_dec's serial output exactly,
+         * for both k values and across the remainder (n1 not divisible by k). */
+        ok = 1;
+        size_t ns[4] = { 8193, 65536, 524289, 1048576 };
+        for (int i = 0; i < 4 && ok; i++) {
+            size_t n = ns[i];
+            uint8_t *in = malloc(n), *bw = malloc(n + 1);
+            uint8_t *ref = malloc(n + 1), *out = malloc(n + 1);
+            if (!in || !bw || !ref || !out) { ok = 0; }
+            else {
+                static const char pat[] =
+                    "the quick brown fox jumps over the lazy dog, 0123456789\n";
+                for (size_t j = 0; j < n; j++)
+                    in[j] = (uint8_t)pat[j % (sizeof pat - 1)];
+                size_t eof = bwt_enc(in, n, bw);
+                int ks[2] = { 8, 16 };
+                for (int ki = 0; ki < 2 && ok; ki++) {
+                    uint32_t anc[16];
+                    if (bwt_make_anchors(bw, n + 1, eof, anc, ks[ki]) != 0 ||
+                        bwt_dec(bw, n + 1, eof, ref) != 0 ||
+                        bwt_dec_anchors(bw, n + 1, eof, anc, ks[ki], out) != 0 ||
+                        memcmp(out, ref, n + 1) != 0) {
+                        fprintf(stderr, "  FAIL: anchor walk n=%zu k=%d\n", n, ks[ki]);
+                        ok = 0;
+                    }
+                }
+            }
+            free(in); free(bw); free(ref); free(out);
+        }
+        CHK(ok, "k-chain LF walk matches serial bwt_dec (k=8,16; 4 sizes)");
     }
 
     printf("\n=== %d failures ===\n", failed);

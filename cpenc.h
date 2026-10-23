@@ -9,17 +9,25 @@ extern "C" {
 
 /* ─── CPEnc block header (12 + stride bytes) ─────────────────── */
 #define CPENC_MAGIC   0x4350   /* 'CP' */
-#define CPENC_VERSION 6        /* what each version added:
+#define CPENC_VERSION 7        /* what each version added:
                                 * v2: stride remainder bytes in stream;
                                 * v3: 1 lag byte before orders (lag delta);
                                 * v4: stride 0xFE = hex-ascii to binary layer;
                                 * v5: stride 0xFD = internal segmentation;
                                 * v6: stride 0xFC = BWT layer and 0xFB/0xFA =
-                                *     reference layers (repeats) */
+                                *     reference layers (repeats);
+                                * v7: stride 0xF9 = BWT with stored LF anchors
+                                *     and RLE2; 0xFC still decodes */
 #define CPENC_STRIDE_RAW 0xFF  /* RAW passthrough stride */
 #define CPENC_STRIDE_HEX 0xFE  /* hex-ascii text: 2:1 to binary + sep table */
 #define CPENC_STRIDE_SEG 0xFD  /* segmented: per-segment lag+stride */
 #define CPENC_STRIDE_BWT 0xFC  /* BWT: reorder then lag/stride (archive-mode) */
+#define CPENC_STRIDE_BWT2 0xF9 /* v7 BWT: BWT + MTF + RLE2, with k stored LF
+                                * anchors so decode can run k chains
+                                * interleaved (see bwt.h).  Emitted when it
+                                * beats the MTF-only 0xFC stream; 0xFC
+                                * blocks still decode through the serial
+                                * path. */
 #define CPENC_STRIDE_REF 0xFB  /* reference layer: repeats as (distance,len) + patches */
 #define CPENC_STRIDE_REF2 0xFA /* reference layer v2: the token stream split
                                  * into columnar sub-streams, one compressor

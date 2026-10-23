@@ -126,7 +126,7 @@ static void try_dataset(const char *name, const uint8_t *data, size_t n) {
     if (!cb) { failed++; checks++; fprintf(stderr, "  FAIL: %s: compress failed\n", name); return; }
     unsigned stride = cb[3];
     printf("  [%s] n=%zu stride=0x%02X cl=%zu\n", name, n, stride, cl);
-    if (stride == CPENC_STRIDE_BWT) covered_bwt = 1;
+    if (stride == CPENC_STRIDE_BWT || stride == CPENC_STRIDE_BWT2) covered_bwt = 1;
 
     size_t caps[] = { 0, 1, 16, n / 2, n > 1 ? n - 1 : 0 };
     for (size_t i = 0; i < sizeof caps / sizeof caps[0]; i++) {
@@ -223,6 +223,72 @@ static void dishonest_bwt(void) {
     free(outer); free(inner); free(raw);
 }
 
+/* ── v7 BWT2 (stride 0xF9) with a corrupt anchor table ──────────────────
+ * The k-anchor table is a new untrusted field: k selects how many 4-byte
+ * positions are read, and each position is where one LF chain starts.
+ * A table with k off the format's range, an anchor outside the block, a
+ * duplicate anchor, or a first anchor that is not the cycle start must be
+ * refused before the walk.  None of them may touch the output buffer.
+ *
+ * Payload layout: [u8 k][u32 eof_row][k * u32 anchors][inner block]. */
+static uint8_t *make_honest_bwt2(size_t n, size_t *cl_out) {
+    uint8_t *src = malloc(n);
+    if (!src) return NULL;
+    gen_source_text(src, n);
+    size_t cl;
+    uint8_t *cb = enc(src, n, 2, &cl);
+    free(src);
+    if (cb && cb[3] == CPENC_STRIDE_BWT2) { *cl_out = cl; return cb; }
+    free(cb);
+    return NULL;
+}
+
+static int bwt2_case(const uint8_t *cb, size_t cl, size_t cap, const char *what) {
+    int rc = decode_with_capacity(cb, cl, cap);
+    checks++;
+    if (rc == -999) { failed++; fprintf(stderr, "  FAIL: BWT2 %s wrote past the capacity\n", what); return 0; }
+    if (rc == 0) { failed++; fprintf(stderr, "  FAIL: BWT2 %s returned success\n", what); return 0; }
+    fprintf(stderr, "  OK BWT2 %s rejected\n", what);
+    return 1;
+}
+
+static void dishonest_bwt2(void) {
+    enum { N = 65536 };
+    size_t cl;
+    uint8_t *base = make_honest_bwt2(N, &cl);
+    checks++;
+    if (!base) {
+        failed++;
+        fprintf(stderr, "  FAIL: BWT2 anchor tests: encoder did not pick BWT2\n");
+        return;
+    }
+    /* k = 8 for a 64KB block; the table starts at byte 13 (after k, eof). */
+    const size_t koff = CPENC_HEADER_SIZE, ancoff = CPENC_HEADER_SIZE + 1 + 4;
+    uint8_t *cb = malloc(cl);
+    if (!cb) { free(base); failed++; return; }
+
+    memcpy(cb, base, cl); cb[koff] = 7;
+    bwt2_case(cb, cl, N, "k=7");
+
+    memcpy(cb, base, cl); cb[koff] = 17;
+    bwt2_case(cb, cl, N, "k=17");
+
+    memcpy(cb, base, cl);
+    cb[ancoff + 4] = 0xFF; cb[ancoff + 5] = 0xFF;
+    cb[ancoff + 6] = 0xFF; cb[ancoff + 7] = 0xFF;
+    bwt2_case(cb, cl, N, "anchor >= n1");
+
+    memcpy(cb, base, cl);
+    memcpy(cb + ancoff + 8, cb + ancoff + 4, 4);   /* anchor[2] = anchor[1] */
+    bwt2_case(cb, cl, N, "duplicate anchors");
+
+    memcpy(cb, base, cl); cb[ancoff] = 1;          /* the cycle starts at 0 */
+    bwt2_case(cb, cl, N, "first anchor != 0");
+
+    free(cb);
+    free(base);
+}
+
 int main(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -284,24 +350,29 @@ int main(void) {
     printf("[cap2] dishonest blocks\n");
     dishonest_hex();
     dishonest_bwt();
+    dishonest_bwt2();
     {
         /* The fuzzer's find: a valid BWT block whose 4-byte primary index is
          * replaced by a value far outside the block.  bwt_dec walked the LF
-         * chain from it and read past the block. */
+         * chain from it and read past the block.  The v7 stride puts the
+         * primary index after the k byte, so the offset depends on which
+         * stride the encoder chose; both paths are still reachable. */
         size_t n = 32768;
         uint8_t *src = malloc(n);
         gen_source_text(src, n);
         size_t cap_len;
         uint8_t *cb = enc(src, n, 2, &cap_len);
         checks++;
-        if (!cb || cb[3] != CPENC_STRIDE_BWT) {
+        if (!cb || (cb[3] != CPENC_STRIDE_BWT && cb[3] != CPENC_STRIDE_BWT2)) {
             failed++;
             fprintf(stderr, "  FAIL: dishonest BWT index: encoder did not pick BWT\n");
         } else {
-            cb[CPENC_HEADER_SIZE + 0] = 0x09;
-            cb[CPENC_HEADER_SIZE + 1] = 0x15;
-            cb[CPENC_HEADER_SIZE + 2] = 0xff;
-            cb[CPENC_HEADER_SIZE + 3] = 0xff;
+            size_t oi_off = cb[3] == CPENC_STRIDE_BWT2 ? CPENC_HEADER_SIZE + 1
+                                                       : CPENC_HEADER_SIZE;
+            cb[oi_off + 0] = 0x09;
+            cb[oi_off + 1] = 0x15;
+            cb[oi_off + 2] = 0xff;
+            cb[oi_off + 3] = 0xff;
             int rc = decode_with_capacity(cb, cap_len, n);
             if (rc == -999) { failed++; fprintf(stderr, "  FAIL: bad BWT index wrote past the capacity\n"); }
             else if (rc == 0) { failed++; fprintf(stderr, "  FAIL: bad BWT index returned success\n"); }

@@ -1824,6 +1824,123 @@ static int h_dec(const uint8_t **sp,const uint8_t *end,uint8_t *dst,size_t n){
     *sp=bse;return 0;
 }
 
+/* ── RLE2: bzip2-style zero-run coding on the MTF stream (v7) ─────
+ * MTF turns BWT clustering into long runs of rank 0, which the generic
+ * order-0 Huffman backend still pays a full symbol each for.  RLE2 folds a
+ * run of z+1 zeros into ceil(log2(z+2)) bytes, bzip2's scheme:
+ *
+ *   code 0 = RUNA (run bit 0), 1 = RUNB (run bit 1),
+ *   2..254 = a literal byte 1..253 (value = code - 1),
+ *   255 = escape followed by the raw byte.
+ *
+ * The escape exists because MTF rank 255 would otherwise need code 256.
+ * Ranks 254 and 255 therefore cost two bytes; every other literal costs
+ * one, and runs cost far less.  Same scheme as the /tmp/algo/codec.c
+ * prototype, which measured +8% ratio on text at 512K blocks.
+ *
+ * rle2_enc returns the encoded length, or 0 if the output does not fit the
+ * capacity (0 can never be a valid encoding: the input is never empty on
+ * this path).  rle2_dec returns the number of bytes it produced — compare
+ * against the expected length — or 0 on a malformed stream. */
+static size_t rle2_enc(const uint8_t *in, size_t n, uint8_t *out, size_t cap) {
+    size_t o = 0, i = 0;
+    while (i < n) {
+        if (in[i] == 0) {
+            size_t j = i; while (j < n && in[j] == 0) j++;
+            uint32_t z = (uint32_t)(j - i) - 1;
+            do {
+                if (o + 2 > cap) return 0;
+                out[o++] = (uint8_t)((z & 1) ? 1 : 0);
+                if (z < 2) break;
+                z = (z - 2) / 2;
+            } while (1);
+            i = j;
+        } else {
+            if (o + 2 > cap) return 0;
+            uint8_t b = in[i++];
+            if (b <= 253) out[o++] = (uint8_t)(b + 1);
+            else { out[o++] = 255; out[o++] = b; }
+        }
+    }
+    return o;
+}
+static size_t rle2_dec(const uint8_t *in, size_t m, uint8_t *out, size_t n) {
+    size_t i = 0, k = 0;
+    while (i < n) {
+        if (k >= m) return 0;
+        uint8_t b = in[k++];
+        if (b <= 1) {
+            int32_t es = -1; uint32_t N = 1; int have = 0;
+            for (;;) {
+                es += (b == 0) ? (int32_t)N : (int32_t)(2 * N);
+                N <<= 1;
+                if (k >= m) break;
+                b = in[k++];
+                if (b > 1) { have = 1; break; }
+            }
+            es++;
+            if (es < 0 || (size_t)es > n - i) return 0;
+            memset(out + i, 0, (size_t)es);
+            i += (size_t)es;
+            if (!have) { if (i != n) return 0; break; }
+        }
+        if (b == 255) {
+            if (k >= m || i >= n) return 0;
+            out[i++] = in[k++];
+        } else {
+            if (b < 2) return 0;
+            out[i++] = (uint8_t)(b - 1);
+        }
+    }
+    return i;
+}
+
+/* Fused RLE2 + MTF decode, for the v7 BWT2 path.  The two passes it
+ * replaces touch a n1-byte intermediate buffer that nothing else reads, and
+ * the run case has a shortcut: a run of zeros decodes to MTF rank 0, whose
+ * move-to-front is a no-op, so the whole run is the current front byte
+ * repeated (a memset) and the MTF state does not change.  Only literals pay
+ * the O(rank) shift.  Saves ~1.8 ms/MB on 512K text blocks.
+ * Same contract as rle2_dec: returns the number of bytes produced, or 0 on
+ * a malformed stream. */
+static size_t rle2_mtf_dec(const uint8_t *in, size_t m, uint8_t *out, size_t n) {
+    uint8_t st[256];
+    for (int i = 0; i < 256; i++) st[i] = (uint8_t)i;
+    size_t i = 0, k = 0;
+    while (i < n) {
+        if (k >= m) return 0;
+        uint8_t b = in[k++];
+        if (b <= 1) {
+            int32_t es = -1; uint32_t N = 1; int have = 0;
+            for (;;) {
+                es += (b == 0) ? (int32_t)N : (int32_t)(2 * N);
+                N <<= 1;
+                if (k >= m) break;
+                b = in[k++];
+                if (b > 1) { have = 1; break; }
+            }
+            es++;
+            if (es < 0 || (size_t)es > n - i) return 0;
+            memset(out + i, st[0], (size_t)es);   /* rank 0 is a no-op move */
+            i += (size_t)es;
+            if (!have) { if (i != n) return 0; break; }
+        }
+        uint8_t r;
+        if (b == 255) {
+            if (k >= m || i >= n) return 0;
+            r = in[k++];
+        } else {
+            if (b < 2) return 0;
+            r = (uint8_t)(b - 1);
+        }
+        uint8_t v = st[r];
+        out[i++] = v;
+        for (int j = r; j > 0; j--) st[j] = st[j - 1];
+        st[0] = v;
+    }
+    return i;
+}
+
 /* ═══════════════════════════════════════════════════════════════
    Public API
    ═══════════════════════════════════════════════════════════════ */
@@ -1832,7 +1949,21 @@ size_t cpenc_max_compressed_size(size_t sl) {
     return CPENC_HEADER_SIZE+16+sl+sl/2+16384;
 }
 
+/* v7: the BWT2 inner call needs the main path with the lag-delta
+ * preprocessor disabled.  The lag scan (v3) is chosen on a sample and is
+ * right for framed records, but on an RLE2-coded MTF stream it fires often
+ * and destroys the run-code structure: measured on the 16MB text corpus it
+ * cost 224KB (5.76x -> 5.50x), while the zero-dense MTF stream it was
+ * already tuned to skip.  `no_lag` is the only difference; every other
+ * caller (including the recursive ones inside) goes through the unchanged
+ * 7-argument entry point, so no existing path changes behaviour. */
+static int cpenc_compress_core(const void *sv, size_t sl, void *dv, size_t *dl,
+                               int mo, int no_bwt, int no_lz, int no_lag);
 int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo, int no_bwt, int no_lz) {
+    return cpenc_compress_core(sv, sl, dv, dl, mo, no_bwt, no_lz, 0);
+}
+static int cpenc_compress_core(const void *sv, size_t sl, void *dv, size_t *dl,
+                               int mo, int no_bwt, int no_lz, int no_lag) {
     lg2_init();
     const uint8_t *s=(const uint8_t*)sv; uint8_t *d=(uint8_t*)dv;
     if(*dl<CPENC_HEADER_SIZE) return -1;
@@ -2164,7 +2295,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * (no frame periodicity to find).  Diff + entropy merged into one pass. */
     int lag_idx = CPENC_LAG_NONE;
     uint8_t *lagbuf = NULL;
-    if (sl >= 4096) {
+    if (!no_lag && sl >= 4096) {
         size_t k = sl < 8192 ? sl : 8192;
         double best_e = ent(s, k);
         int best_p = 0;
@@ -2677,8 +2808,15 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * byte entropy ~7.1 but collapses to a few hundred bytes), and
      * accepting on that bound lost 317x -> 68x.  Archive-oriented: the
      * sort is slow, so it must earn its place.
-     * Format: [eof_row u32][payload], payload = compressed BWT stream
-     * (recursed with no_bwt=1 so it never re-enters this candidate). */
+     *
+     * v7 (stride 0xF9) adds a second candidate.  Format:
+     *   [u8 k][eof_row u32][k * anchor u32][inner cpenc block]
+     * where the inner block is the RLE2-coded MTF stream, compressed with
+     * no_bwt=1, no_lz=1 so it never re-enters this candidate.  The anchors
+     * let decode run k LF chains at once.  It competes with the v6 0xFC
+     * stream (MTF only, serial decode) and the smaller block is emitted;
+     * 0xFC therefore still appears, and still decodes through its original
+     * path. */
     /* Probe measured unconditionally under CPENC_VFEAT so the REF-winning
      * blocks get a drop value too — this is the experiment that decides
      * whether the drop can act as a pre-REF discriminator. */
@@ -2707,8 +2845,16 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
          *    rejects those at 1/16th the sort cost (measured MTF drop:
          *    text +2.85, f32 -0.12 — a clean separation the entropy
          *    window cannot make, since their per-segment byte entropies
-         *    overlap at 5.1-6.1). */
-        if (e > 4.7 && e < 7.2 && main_len > CPENC_HEADER_SIZE + 4 + 64 &&
+         *    overlap at 5.1-6.1).
+         * The old lower bound e > 4.7 is gone: a block whose first 2KB are
+         * very repetitive but whose body is not (a header over a log, mixed
+         * segments) was being skipped, and with anchors+RLE2 the BWT
+         * candidate now beats the main path there.  Measured on the 16MB
+         * text corpus: 3 of 32 blocks flip to BWT2, 5.52x -> 5.60x, while
+         * floats/random/binary are unchanged (their prefix entropy is above
+         * the old bound anyway and the probe still rejects them).  The
+         * upper bound stays: above 7.2 bits/byte there is nothing to sort. */
+        if (e < 7.2 && main_len > CPENC_HEADER_SIZE + 4 + 64 &&
             main_len * 8 > sl) {
             size_t pn = sl < 4096 ? sl : 4096;
             uint8_t *pb = malloc(pn + 1);
@@ -2728,33 +2874,94 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
             uint8_t *bw = probe_ok ? malloc(sl + 1) : NULL;
             if (bw) {
                 size_t oi = bwt_enc(s_bwt, sl, bw);
+                /* v7: record k anchors along the LF cycle *before* MTF
+                 * destroys the L column.  anchor[j] is the position j*m
+                 * steps along the cycle (m = (sl+1)/k); the decoder starts
+                 * one chain per anchor, which breaks the serial latency of
+                 * the single LF chain.  8 anchors already reach the
+                 * memory-level-parallelism plateau; 16 help on 1MB blocks. */
+                int k = (sl <= (512u << 10)) ? 8 : 16;
+                uint32_t anc[16];
+                int anc_ok = bwt_make_anchors(bw, sl + 1, oi, anc, k) == 0;
                 /* bzip2-style: MTF on the BWT stream turns its local
                  * clustering into long zero runs (RLE territory) */
                 mtf_enc_inplace(bw, sl + 1);
-                /* The inner call's per-group capacity checks are upper
-                 * bounds (gs*bits/8), so it needs the full worst-case
-                 * buffer to run at all — sizing this at main_len made it
-                 * bail with -1 and silently dropped every BWT win. */
-                size_t bcap = cpenc_max_compressed_size(sl + 1) + 64;
-                uint8_t *bb = malloc(bcap);
-                if (bb) {
-                    size_t cl = bcap - (CPENC_HEADER_SIZE + 4);
-                    if (cpenc_compress_impl(bw, sl + 1, bb + CPENC_HEADER_SIZE + 4,
-                                            &cl, mo, 1, 1) == 0 &&
-                        CPENC_HEADER_SIZE + 4 + cl < main_len) {
-                        hdr_put((uint8_t*)bb, CPENC_STRIDE_BWT, (uint32_t)sl, (uint32_t)(cl + 4));
-                        bb[CPENC_HEADER_SIZE+0] = (uint8_t)oi;
-                        bb[CPENC_HEADER_SIZE+1] = (uint8_t)(oi>>8);
-                        bb[CPENC_HEADER_SIZE+2] = (uint8_t)(oi>>16);
-                        bb[CPENC_HEADER_SIZE+3] = (uint8_t)(oi>>24);
-                        memcpy(d, bb, CPENC_HEADER_SIZE + 4 + cl);
-                        *dl = CPENC_HEADER_SIZE + 4 + cl;
-                        free(bb); free(bw);
-                        free(trial); free(trans); free(lagbuf); free(hexbuf);
-                        return 0;
+                /* RLE2: fold those zero runs before the Huffman pass.
+                 * MTF ranks 254/255 cost two bytes each, everything else
+                 * stays one, so this is the bzip2 scheme. */
+                uint8_t *rle = anc_ok ? malloc(2 * (sl + 1) + 8) : NULL;
+                size_t rn = rle ? rle2_enc(bw, sl + 1, rle, 2 * (sl + 1) + 8) : 0;
+                /* Never trust a transform blind: decode the run stream back
+                 * and compare before spending a Huffman pass on it.  The
+                 * standalone prototype's self-test caught a real bug, so it
+                 * ships in the encoder too; a mismatch drops the candidate
+                 * rather than emitting a stream that cannot round-trip. */
+                int rle_ok = 0;
+                if (rn) {
+                    uint8_t *chk = malloc(sl + 1);
+                    if (chk) {
+                        rle_ok = (rle2_dec(rle, rn, chk, sl + 1) == sl + 1 &&
+                                  memcmp(chk, bw, sl + 1) == 0);
+                        free(chk);
                     }
-                    free(bb);
                 }
+                if (rle_ok) {
+                    /* One candidate, chosen by the only cheap signal that
+                     * predicts the winner: whether RLE2 actually shortens the
+                     * MTF stream.  MTF ranks 254/255 cost two bytes each, so
+                     * RLE2 can expand; when it does, the plain MTF stream
+                     * wins.  Measured on 16MB of text: RLE2 wins 30 of 32
+                     * blocks, records 16 of 16, and the two MTF wins are
+                     * 0.15% and 0.66% of their block.  Compressing both
+                     * candidates bought 0.02% ratio for 2x encode, so the
+                     * loser is not computed any more. */
+                    int use_rle = (rn < sl + 1);
+                    size_t ovh = use_rle ? (1 + 4 + (size_t)k * 4) : 4;
+                    size_t bcap = cpenc_max_compressed_size(use_rle ? rn : sl + 1) + 64;
+                    uint8_t *bb = malloc(bcap);
+                    if (bb) {
+                        size_t cl = bcap - (CPENC_HEADER_SIZE + ovh);
+                        int rc;
+                        if (use_rle)
+                            rc = cpenc_compress_core(rle, rn, bb + CPENC_HEADER_SIZE + ovh,
+                                                     &cl, mo, 1, 1, 1);
+                        else
+                            rc = cpenc_compress_impl(bw, sl + 1, bb + CPENC_HEADER_SIZE + ovh,
+                                                     &cl, mo, 1, 1);
+                        if (rc == 0 && CPENC_HEADER_SIZE + ovh + cl < main_len) {
+                            uint8_t *p = bb + CPENC_HEADER_SIZE;
+                            if (use_rle) {
+                                hdr_put((uint8_t*)bb, CPENC_STRIDE_BWT2, (uint32_t)sl,
+                                        (uint32_t)(ovh + cl));
+                                *p++ = (uint8_t)k;
+                                *p++ = (uint8_t)oi;
+                                *p++ = (uint8_t)(oi >> 8);
+                                *p++ = (uint8_t)(oi >> 16);
+                                *p++ = (uint8_t)(oi >> 24);
+                                for (int j = 0; j < k; j++) {
+                                    *p++ = (uint8_t)anc[j];
+                                    *p++ = (uint8_t)(anc[j] >> 8);
+                                    *p++ = (uint8_t)(anc[j] >> 16);
+                                    *p++ = (uint8_t)(anc[j] >> 24);
+                                }
+                            } else {
+                                hdr_put((uint8_t*)bb, CPENC_STRIDE_BWT, (uint32_t)sl,
+                                        (uint32_t)(ovh + cl));
+                                *p++ = (uint8_t)oi;
+                                *p++ = (uint8_t)(oi >> 8);
+                                *p++ = (uint8_t)(oi >> 16);
+                                *p++ = (uint8_t)(oi >> 24);
+                            }
+                            memcpy(d, bb, CPENC_HEADER_SIZE + ovh + cl);
+                            *dl = CPENC_HEADER_SIZE + ovh + cl;
+                            free(bb); free(rle); free(bw);
+                            free(trial); free(trans); free(lagbuf); free(hexbuf);
+                            return 0;
+                        }
+                        free(bb);
+                    }
+                }
+                free(rle);
                 free(bw);
             }
         }
@@ -2864,7 +3071,8 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
     if(sl > (size_t)CPENC_MAX_BLOCK + 64) return -1;
     /* Every stride except HEX and SEG produces exactly h->original_size bytes,
      * so the caller's capacity can be checked once, here, rather than trusting
-     * each branch to remember.  It did not: the BWT branch wrote
+     * each branch to remember.  BWT2 (0xF9) is in that flat group: it emits
+     * exactly original_size bytes.  It did not: the BWT branch wrote
      * original_size bytes into whatever buffer it was handed, which is a heap
      * overflow when the caller sized that buffer from a different (equally
      * untrusted) number.  HEX and SEG are exempt because they legitimately
@@ -3079,6 +3287,79 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         free(bw);
         *dl = h->original_size;
         return 0;
+    }
+
+    if(h->stride==CPENC_STRIDE_BWT2){
+        /* v7: [u8 k][eof_row u32][k * u32 anchors][inner cpenc block].
+         * The inner block decodes to the RLE2 stream; undo RLE2, undo MTF,
+         * then walk the LF cycle as k interleaved chains and strip the
+         * sentinel exactly as the 0xFC path does.  Everything in the
+         * payload is untrusted: k, the primary index, the anchors and the
+         * inner header all come off disk. */
+        if(sl < CPENC_HEADER_SIZE + 1 + 4) return -1;
+        const uint8_t *rp = s + CPENC_HEADER_SIZE;
+        size_t pl = h->compressed_size;
+        if(pl > (size_t)(sl - CPENC_HEADER_SIZE)) return -1;
+        unsigned k = rp[0];
+        if(k < 8 || k > 16) return -1;           /* the format's own range */
+        size_t ovh = 1 + 4 + (size_t)k * 4;
+        if(pl < ovh + CPENC_HEADER_SIZE) return -1;
+        /* Redundant with the entry check, as in the 0xFC branch: this is
+         * the memcpy that writes original_size bytes. */
+        if(*dl < h->original_size) return -1;
+        size_t n1 = (size_t)h->original_size + 1;
+        if(n1 < (size_t)k) return -1;
+        uint32_t oi = (uint32_t)rp[1] | ((uint32_t)rp[2] << 8) |
+                      ((uint32_t)rp[3] << 16) | ((uint32_t)rp[4] << 24);
+        uint32_t anc[16];
+        for (unsigned j = 0; j < k; j++) {
+            const uint8_t *q = rp + 5 + (size_t)j * 4;
+            anc[j] = (uint32_t)q[0] | ((uint32_t)q[1] << 8) |
+                     ((uint32_t)q[2] << 16) | ((uint32_t)q[3] << 24);
+        }
+        /* Reject a corrupt table before allocating: the walk below must
+         * never start from a position it cannot trust.  The anchors are
+         * positions along the LF cycle, so they are in range but unordered;
+         * only duplicates are structurally invalid (two chains would start
+         * on the same cycle position).  bwt_dec_anchors repeats these
+         * checks (defence in depth) and bounds every step. */
+        if(oi >= n1 || anc[0] != 0) return -1;
+        for (unsigned j = 0; j < k; j++) {
+            if(anc[j] >= n1) return -1;
+            for (unsigned i = 0; i < j; i++)
+                if(anc[j] == anc[i]) return -1;
+        }
+        const uint8_t *ip = rp + ovh;
+        size_t ilen = pl - ovh;
+        /* The inner block's declared size is the RLE2 stream length.  RLE2
+         * output is at most 2 bytes per input byte, so a stream longer than
+         * 2*n1 cannot belong to this block — and this bound keeps the
+         * malloc from following a corrupt header anywhere.  HEX/SEG inner
+         * blocks restore to more than they declare, so those get the
+         * expanded bound; the recursive decoder checks every write against
+         * the capacity it is handed. */
+        uint32_t in_orig = (uint32_t)ip[4] | ((uint32_t)ip[5] << 8) |
+                           ((uint32_t)ip[6] << 16) | ((uint32_t)ip[7] << 24);
+        if(in_orig == 0 || (size_t)in_orig > 2 * n1) return -1;
+        size_t rcap = (ip[3] == CPENC_STRIDE_HEX || ip[3] == CPENC_STRIDE_SEG)
+                      ? 4 * n1 + 64 : (size_t)in_orig;
+        uint8_t *r = malloc(rcap);
+        uint8_t *bw = malloc(n1);
+        uint8_t *tmp = malloc(n1);
+        if(!r || !bw || !tmp){ free(r); free(bw); free(tmp); return -2; }
+        size_t outl = rcap;
+        int rc = cpenc_decompress(ip, ilen, r, &outl);
+        if(rc != 0 || outl > rcap) rc = -1;
+        /* Undo RLE2 and MTF in one pass (no intermediate buffer), then walk
+         * the LF cycle as k interleaved chains. */
+        else if(rle2_mtf_dec(r, outl, bw, n1) != n1) rc = -1;
+        else rc = bwt_dec_anchors(bw, n1, oi, anc, (int)k, tmp);
+        if(rc == 0){
+            memcpy(d, tmp + 1, h->original_size);   /* strip the EOF symbol */
+            *dl = h->original_size;
+        }
+        free(r); free(bw); free(tmp);
+        return rc == 0 ? 0 : -1;
     }
 
     if(h->stride==CPENC_STRIDE_REF){
