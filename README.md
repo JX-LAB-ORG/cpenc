@@ -63,6 +63,22 @@ make bench      # benchmark tools
 Needs C11 and pthread. x86-64 builds with `-march=x86-64-v2` by default; the
 AVX2 kernel needs `make ARCHFLAGS=-march=x86-64-v3` (see "Known limits").
 
+## Quick start
+
+```c
+#include "cpenc.h"
+
+size_t cap = cpenc_max_compressed_size(n);
+uint8_t *out = malloc(cap);
+if (cpenc_compress(in, n, out, &cap, 2) != 0) { /* too small / error */ }
+/* cap is now the compressed size */
+
+size_t dl = n;                       /* capacity in, real size out */
+if (cpenc_decompress(out, cap, back, &dl) != 0 || dl != n) { /* corrupt */ }
+```
+
+Link with the two objects: `cc app.c cpenc.o bwt.o -lm`.
+
 ## API
 
 ```c
