@@ -937,6 +937,10 @@ static int ref_unpack2(const uint8_t *pl, size_t pln, uint8_t *tok, size_t tn) {
     int rc = 0;
     for (int i = 0; i < REF2_NSUB; i++) {
         if (off + cl[i] > pln) { rc = -1; break; }
+        /* ul[] is an untrusted u32 and was used as an allocation size as-is:
+         * a header asking for 4 GiB is a memory-exhaustion request, not a
+         * stream.  No column can be larger than a few bytes per token. */
+        if (ul[i] > tn * 4 + 64) { rc = -1; break; }
         ub[i] = malloc(ul[i] ? ul[i] : 1);
         if (!ub[i]) { rc = -2; break; }
         size_t o = ul[i];
@@ -1574,7 +1578,15 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
              * has to carry the block's case: writing it lowercase turned
              * the last 'A' of 257 of them into 'a' on the way back. */
             uint8_t hex_lit = (uint8_t)(hex_case ? 'A' : 'a');
-            size_t blk = 13 + sl + sl / 2 + 16; /* hdr + table scratch + bin scratch */
+            /* The separator table is written at offset 13+sl and moved down
+             * afterwards, so it needs its own worst-case scratch.  The gate
+             * above guarantees at least 90% hex characters, so separators are
+             * at most sl/10; each separator can cost two entries (a lone
+             * nibble and the separator itself), and an entry is a LEB128 index
+             * (up to 5 bytes) plus the character — 1.2*sl in the limit.  The
+             * old sl/2+16 was not enough: 9 hex digits per line hits the gate
+             * exactly and overran it by 3.1MB on an 8MB block. */
+            size_t blk = 13 + sl + sl + sl / 4 + 64;
             hexbuf = malloc(blk);
             if (hexbuf) {
                 size_t n_sep = 0, bin_len = 0;
@@ -1614,6 +1626,11 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                     for (int b2 = 0; b2 < ln; b2++) hexbuf[13 + sl + n_sep++] = lb[b2];
                     hexbuf[13 + sl + n_sep++] = (uint8_t)(pend < 10 ? '0' + pend : hex_lit + pend - 10);
                 }
+                /* The allocation above is sized for the worst case the gate
+                 * can admit; this guards the invariant rather than a known
+                 * input, so a future bound change fails loudly instead of
+                 * quietly corrupting the heap. */
+                if ((size_t)13 + bin_len + n_sep > blk) { free(hexbuf); return -1; }
                 memmove(hexbuf + 13 + bin_len, hexbuf + 13 + sl, n_sep);  /* table after bin: lag scan sees clean bin */
                 hexbuf[0] = (uint8_t)(orig_len & 0xFF); hexbuf[1] = (uint8_t)((orig_len >> 8) & 0xFF);
                 hexbuf[2] = (uint8_t)((orig_len >> 16) & 0xFF); hexbuf[3] = (uint8_t)((orig_len >> 24) & 0xFF);
@@ -1904,7 +1921,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
 
     size_t gs=sl/(size_t)stride;
     uint8_t *trans = malloc(sl); if(!trans){free(lagbuf);free(hexbuf);return -2;}
-    uint8_t *trial = malloc(4096); if(!trial){free(trans);return-2;}
+    uint8_t *trial = malloc(4096); if(!trial){free(trans);free(lagbuf);return-2;}
 
     if(stride==1){memcpy(trans,s,sl);}
     else{tr(s,trans,sl,stride);}
@@ -2359,7 +2376,7 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
                         memcpy(d, bb, CPENC_HEADER_SIZE + 4 + cl);
                         *dl = CPENC_HEADER_SIZE + 4 + cl;
                         free(bb); free(bw);
-                        free(trial); free(trans); free(hexbuf);
+                        free(trial); free(trans); free(lagbuf); free(hexbuf);
                         return 0;
                     }
                     free(bb);
@@ -2375,13 +2392,13 @@ int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo,
      * the candidate's stride. */
     if (lz_won) {
         *dl = (size_t)(out - d);
-        free(trial); free(trans); free(hexbuf);
+        free(trial); free(trans); free(lagbuf); free(hexbuf);
         return 0;
     }
 
     hdr_head((uint8_t*)d, hex_mode ? CPENC_STRIDE_HEX : (uint8_t)stride, (uint32_t)sl);
     hdr_comp((uint8_t*)d, (uint32_t)(out-(d+CPENC_HEADER_SIZE)));
-    *dl=(size_t)(out-d); free(trial); free(trans); free(hexbuf); return 0;
+    *dl=(size_t)(out-d); free(trial); free(trans); free(lagbuf); free(hexbuf); return 0;
 }
 
 /* Upper bound on the ENCODED run stream of a tag-4 (RLE) group — which is
@@ -2471,6 +2488,17 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
      * a corrupt field — and every subsequent bounds check inside would be
      * arithmetic on a pointer that far out of range. */
     if(sl > (size_t)CPENC_MAX_BLOCK + 64) return -1;
+    /* Every stride except HEX and SEG produces exactly h->original_size bytes,
+     * so the caller's capacity can be checked once, here, rather than trusting
+     * each branch to remember.  It did not: the BWT branch wrote
+     * original_size bytes into whatever buffer it was handed, which is a heap
+     * overflow when the caller sized that buffer from a different (equally
+     * untrusted) number.  HEX and SEG are exempt because they legitimately
+     * expand beyond the declared size — a hex sub-block restores to about
+     * twice its folded length — and carry their own checks. */
+    if (h->stride != CPENC_STRIDE_HEX && h->stride != CPENC_STRIDE_SEG &&
+        *dl < (size_t)h->original_size)
+        return -1;
     if(h->stride==CPENC_STRIDE_SEG){
         /* v5: independent sub-blocks, lengths in a u32 array */
         const uint8_t *p = s + CPENC_HEADER_SIZE;
@@ -2547,6 +2575,10 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         size_t o = 0;
         for(uint32_t k = 0; k < n_seg; k++) {
             uint32_t clen = (uint32_t)p[k*4] | ((uint32_t)p[k*4+1]<<8) | ((uint32_t)p[k*4+2]<<16) | ((uint32_t)p[k*4+3]<<24);
+            /* The parallel path rejects a segment shorter than a header before
+             * reading it; this one read four bytes of sp[4..7] regardless, off
+             * the end of a short segment near the block's tail. */
+            if (clen < CPENC_HEADER_SIZE) return -1;
             size_t dl_k = (size_t)sp[4] | ((size_t)sp[5] << 8) | ((size_t)sp[6] << 16) | ((size_t)sp[7] << 24);
             /* decode into the remaining output space: a hex-wrapped segment
              * restores to more than its declared size */
@@ -2589,6 +2621,15 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         if((size_t)13 + n_sep + bin_len > tdl){ free(tmp); return -1; }
         size_t restore = (size_t)orig_len;
         if(*dl < restore){ free(tmp); return -1; }
+        /* `restore` is a number the payload declares; the loop below writes
+         * 2*bin_len characters plus one per separator-table entry, and only
+         * the final `o != restore` catches a mismatch — long after the writes
+         * have happened.  A payload declaring a short text length alongside a
+         * long packed buffer therefore walked past the caller's capacity.
+         * Bound every write instead of trusting a relation: n_sep is the
+         * table's byte length, not its entry count, so no closed-form check
+         * is available anyway. */
+        const size_t dcap = *dl;
         const uint8_t *bin = tmp + 13;
         const uint8_t *tab = bin + bin_len;
         static const char *hexd_lc = "0123456789abcdef";
@@ -2609,9 +2650,13 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
                     sh += 7;
                     if (oi >= n_sep && (b & 0x80)) { free(tmp); return -1; }
                 }
-                if(idx == vi) { d[o++] = tab[oi++];  }
+                if(idx == vi) {
+                    if (o + 1 > dcap) { free(tmp); return -1; }
+                    d[o++] = tab[oi++];
+                }
                 else { oi = save; break; }
             }
+            if (o + 2 > dcap) { free(tmp); return -1; }
             d[o++] = (uint8_t)hexd[bin[i] >> 4];
             d[o++] = (uint8_t)hexd[bin[i] & 0xF];
             vi++;
@@ -2626,6 +2671,7 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
                 sh += 7;
             }
             if(idx != vi){ free(tmp); return -1; }
+            if (o + 1 > dcap) { free(tmp); return -1; }
             d[o++] = tab[oi++];
         }
         if(o != restore){ free(tmp); return -1; }
@@ -2639,6 +2685,10 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         uint32_t oi=(uint32_t)rp[0]|((uint32_t)rp[1]<<8)|((uint32_t)rp[2]<<16)|((uint32_t)rp[3]<<24);
         size_t pl = h->compressed_size - 4;
         if(pl > (size_t)(sl - CPENC_HEADER_SIZE - 4)) return -1;
+        /* Redundant with the entry check above, and kept on purpose: this is
+         * the branch that lost it once, and the memcpy at the end writes
+         * exactly this many bytes. */
+        if(*dl < h->original_size) return -1;
         uint8_t *bw = malloc(h->original_size + 1);
         if(!bw) return -2;
         size_t outl = h->original_size + 1;
@@ -2647,7 +2697,9 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         mtf_dec_inplace(bw, outl);               /* undo MTF -> BWT stream */
         uint8_t *tmp = malloc(outl);
         if(!tmp){ free(bw); return -2; }
-        bwt_dec(bw, outl, oi, tmp);              /* n+1 rows, EOF 0 first */
+        /* n+1 rows, the EOF row first.  bwt_dec validates the primary index
+         * and the LF chain: both come out of the untrusted payload. */
+        if (bwt_dec(bw, outl, oi, tmp) != 0) { free(tmp); free(bw); return -1; }
         memcpy(d, tmp + 1, h->original_size);    /* strip the EOF symbol */
         free(tmp);
         free(bw);

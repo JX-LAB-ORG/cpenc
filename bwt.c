@@ -177,15 +177,20 @@ size_t bwt_enc(const uint8_t *s, size_t n, uint8_t *out) {
  * one occurrence from the character counts restores the true alphabet,
  * where the sentinel is unique and strictly smallest.  For inputs with no
  * 0x00 byte this yields exactly the same LF as the naive build. */
-void bwt_dec(const uint8_t *b, size_t n1, size_t eof_row, uint8_t *out) {
+int bwt_dec(const uint8_t *b, size_t n1, size_t eof_row, uint8_t *out) {
+    /* Both inputs come from an untrusted container.  The primary index was
+     * used unchecked, and the LF chain it produces was followed unchecked:
+     * a crafted block (primary index 0xffff1509 in a 16 KB block was the
+     * fuzzer's example) walked off the end of b[]. */
+    if (n1 == 0 || eof_row >= n1) return -1;
     uint32_t cnt[256] = {0};
     for (size_t i = 0; i < n1; i++) cnt[b[i]]++;
-    if (eof_row < n1) cnt[b[eof_row]]--;      /* sentinel is not a character */
+    cnt[b[eof_row]]--;                        /* sentinel is not a character */
     uint32_t start[256];
     uint32_t sum = 0;
     for (int i = 0; i < 256; i++) { start[i] = sum; sum += cnt[i]; }
     uint32_t *lf = malloc(n1 * sizeof(uint32_t));
-    if (!lf) return;
+    if (!lf) return -1;
     uint32_t cpos[256];
     memcpy(cpos, start, sizeof(cpos));
     for (size_t i = 0; i < n1; i++) {
@@ -194,8 +199,10 @@ void bwt_dec(const uint8_t *b, size_t n1, size_t eof_row, uint8_t *out) {
     }
     size_t pos = 0;
     for (size_t i = n1; i-- > 0;) {
+        if (pos >= n1) { free(lf); return -1; }      /* chain left the block */
         out[i] = b[pos];
         pos = lf[pos];
     }
     free(lf);
+    return 0;
 }
