@@ -31,7 +31,7 @@ libcpool_hook.o: libcpool_hook.c cpool.h
 libcpool_hook.so: cpenc.o cpool.o libcpool_hook.o
 	cc $(CFLAGS) -std=gnu11 -shared -fPIC -o $@ $^ -lpthread -ldl
 
-test: cpenc.o cpool.o bwt.o test/cpenc_test.c test/cpenc_roundtrip_test.c test/cpool_test.c test/cpool_disk_test.c
+test: cpenc.o cpool.o bwt.o test/cpenc_test.c test/cpenc_roundtrip_test.c test/cpenc_capacity_test.c test/cpool_test.c test/cpool_disk_test.c
 	cc $(CFLAGS) test/cpenc_test.c cpenc.o bwt.o -lm -o test/cpenc_test
 	./test/cpenc_test
 	cc $(CFLAGS) test/cpenc_roundtrip_test.c cpenc.o bwt.o -lm -o test/cpenc_roundtrip_test
@@ -42,6 +42,8 @@ test: cpenc.o cpool.o bwt.o test/cpenc_test.c test/cpenc_roundtrip_test.c test/c
 	./test/cpool_disk_test
 	cc $(CFLAGS) test/cpenc_rle_test.c cpenc.c bwt.o -lm -o test/cpenc_rle_test
 	./test/cpenc_rle_test
+	cc $(CFLAGS) test/cpenc_capacity_test.c cpenc.o bwt.o -lm -o test/cpenc_capacity_test
+	./test/cpenc_capacity_test
 
 # Codec benchmark: ratio + throughput over a real file, per stride.
 bench: test/bench_cpenc test/cpenc_verify test/cpenc_bisect
@@ -71,4 +73,4 @@ fuzz-rt:
 	sh test/fuzz_rt.sh $(SECS)
 
 clean:
-	rm -f *.o *.so test/cpenc_test test/cpool_test test/fuzz_seed test/fuzz_cpenc test/fuzz_roundtrip test/bench_cpenc test/cpenc_verify test/cpenc_bisect test/cpenc_rle_test test/avx2_lut_check
+	rm -f *.o *.so test/cpenc_test test/cpool_test test/fuzz_seed test/fuzz_cpenc test/fuzz_roundtrip test/bench_cpenc test/cpenc_verify test/cpenc_bisect test/cpenc_rle_test test/cpenc_capacity_test test/avx2_lut_check

@@ -21,6 +21,85 @@ static uint32_t rnd(void) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return (uin
 
 static int seed_no;
 
+/* A BWT block paired with a capacity far smaller than the block declares.
+ *
+ * The BWT branch rebuilds h->original_size bytes from the inner stream; a
+ * caller that sizes its output buffer from some other (equally untrusted)
+ * field — the inode table is exactly such a place — gets an overflow unless
+ * the decoder compares the two.  Random mutation cannot make this input:
+ * the block has to be a genuinely self-consistent BWT stream, which only the
+ * encoder can produce, and then have its capacity prefix disagree with it.
+ *
+ * The source text is synthetic source code on purpose.  Prose and repeated
+ * logs go to REF/REF2, and structured tables go to the delta path; code-like
+ * text with a wide identifier vocabulary is what actually makes the encoder
+ * pick stride 0xFC.  Verified below before anything is written.
+ */
+#define BWT_SEED_N  16384
+#define BWT_SEED_CAP 16u
+
+static void emit_bwt_small_cap(const char *dir) {
+    static const char *kw[] = {
+        "int", "return", "static", "if", "else", "for", "while", "struct",
+        "const", "char", "size_t", "void", "uint32_t", "buf", "len", "data",
+        "ptr", "idx", "count", "value"
+    };
+    uint8_t *src = malloc(BWT_SEED_N);
+    size_t cap = cpenc_max_compressed_size(BWT_SEED_N);
+    uint8_t *c = malloc(cap);
+    if (!src || !c) { free(src); free(c); return; }
+
+    /* deterministic, independent of the rnd() stream used above */
+    uint64_t rs = 0xD1B54A32D192ED03ull;
+    size_t o = 0;
+    while (o < BWT_SEED_N) {
+        size_t room = BWT_SEED_N - o;
+        const char *a = kw[rs % 20], *b2 = kw[(rs >> 8) % 20], *e = kw[(rs >> 16) % 20];
+        unsigned x = (unsigned)(rs % 1000), y = (unsigned)((rs >> 20) % 100000);
+        int w;
+        rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17;
+        switch (rs % 5) {
+        case 0: w = snprintf((char *)src + o, room, "    %s %s_%u = %u;\n", a, b2, x, y); break;
+        case 1: w = snprintf((char *)src + o, room, "if (%s_%u > %u) { %s(%s, %u); }\n", a, x % 100, y, b2, e, x); break;
+        case 2: w = snprintf((char *)src + o, room, "/* %u %u %u %u */\n", x % 10, y % 10, (x + y) % 10, (x * y) % 10); break;
+        case 3: w = snprintf((char *)src + o, room, "%s_%u += %s[%u] * 0x%x;\n", a, x % 50, b2, y % 64, x % 256); break;
+        default:w = snprintf((char *)src + o, room, "while (%s < %u) { %s_%u++; }\n", a, x, b2, y % 77); break;
+        }
+        if (w < 0) break;
+        o += (size_t)w < room ? (size_t)w : room;   /* snprintf truncates at room */
+    }
+
+    size_t cl = cap;
+    CPEncHeader h;
+    if (o != BWT_SEED_N || cpenc_compress(src, BWT_SEED_N, c, &cl, 2) != 0) {
+        fprintf(stderr, "bwt-small-cap: encoder call failed\n");
+        free(src); free(c);
+        return;
+    }
+    memcpy(&h, c, sizeof h);
+    if (h.stride != CPENC_STRIDE_BWT) {
+        /* Force-BWT failed: say so rather than writing a seed that misses
+         * the branch.  (Not expected with this text; order 4 is the next
+         * knob if a future encoder gate rejects order 2.) */
+        fprintf(stderr, "bwt-small-cap: encoder picked stride 0x%02X, not 0xFC; seed not written\n",
+                h.stride);
+        free(src); free(c);
+        return;
+    }
+
+    char path[512];
+    snprintf(path, sizeof path, "%s/bwt-small-cap.seed", dir);
+    FILE *f = fopen(path, "wb");
+    if (!f) { free(src); free(c); return; }
+    uint32_t room = BWT_SEED_CAP;               /* deliberately too small */
+    fwrite(&room, 4, 1, f);
+    fwrite(c, 1, cl, f);
+    fclose(f);
+    printf("wrote %s (%zu bytes, stride 0x%02X, declares %u)\n",
+           path, cl + 4, h.stride, h.original_size);
+    free(src); free(c);
+}
+
 static void emit(const uint8_t *src, size_t n, int order, size_t blk, const char *dir) {
     size_t cap = cpenc_max_compressed_size(blk);
     uint8_t *c = malloc(cap);
@@ -78,6 +157,8 @@ int main(int argc, char **argv) {
     for (int o = 0; o <= 4; o += 2) emit(b, N, o, 65536, dir);
     for (size_t i = 0; i < N; i++) b[i] = (uint8_t)((i / 500) & 0xFF);
     for (int o = 0; o <= 4; o += 2) emit(b, N, o, 65536, dir);
+
+    emit_bwt_small_cap(dir);
 
     printf("wrote %d seeds to %s\n", seed_no, dir);
     free(b);

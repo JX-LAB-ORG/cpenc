@@ -190,6 +190,26 @@ int main(void) {
         CHK(ok, "1.5MB of hex text inside a segmented block");
     }
 
+    printf("[c9] nine hex digits per line (the separator table's worst case)\n");
+    /* The hex gate admits a block at exactly 90% hex characters.  Nine digits
+     * plus a newline sits on that boundary, and every line leaves one unpaired
+     * nibble, so each line writes two separator-table entries instead of one.
+     * The encoder's scratch for that table was sized sl/2+16 and overflowed by
+     * 3.1MB on an 8MB block; the allocation is now derived from the gate and
+     * the post-build check fails loudly if it is ever too small again. */
+    {
+        size_t n = 65536;
+        uint8_t *in = malloc(n);
+        static const char hd[] = "0123456789ABCDEF";
+        ok = in != NULL;
+        for (size_t o = 0; ok && o < n; ) {
+            for (int i = 0; i < 9; i++) in[o++] = (uint8_t)hd[rnd() % 16];
+            if (o < n) in[o++] = '\n';
+        }
+        if (in) { if (ok) ok = rt(in, n); free(in); }
+        CHK(ok, "9 hex digits per line round-trips");
+    }
+
     printf("\n=== %d failures ===\n", failed);
     return failed ? 1 : 0;
 }

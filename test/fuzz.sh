@@ -20,6 +20,17 @@ if [ -z "$(ls -A "$CORPUS" 2>/dev/null)" ]; then
     ./test/fuzz_seed "$CORPUS" || exit 1
 fi
 
+# Hand-built seeds that random mutation cannot construct (a self-consistent
+# BWT block whose capacity prefix is deliberately too small) are kept in
+# test/fuzz_seeds/ and copied into the corpus on every run, including runs
+# against a corpus that is already populated.
+if [ -d test/fuzz_seeds ]; then
+    for f in test/fuzz_seeds/*.seed; do
+        [ -e "$f" ] || continue
+        cp "$f" "$CORPUS"/ || exit 1
+    done
+fi
+
 clang -fsanitize=fuzzer,undefined -fno-sanitize-recover=all -O1 -g -I. \
       test/fuzz_cpenc.c cpenc.c bwt.c -lm -o test/fuzz_cpenc || exit 1
 
