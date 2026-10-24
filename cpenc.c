@@ -3794,11 +3794,21 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
             free(runs_buf);free(vals_buf);free(scratch);
         }else{
             int hrc;
-            if(stride==1 && orders[g]==1 && lag_idx==0){
+            /* The encoder picks h_enc_seg for any group of 1MiB or more,
+             * whatever its orders/lag are, so this test has to come first.
+             * With the fused test in front, a single group (stride 1) at
+             * order 1 and lag 0 went to h_dec_p, which read a segmented
+             * stream as a classical table: usually a decode error, but when
+             * the misread length came out zero it returned success with an
+             * empty output, and the hex wrapper above turned that into
+             * "0 bytes decompressed, no error" — silent whole-block loss.
+             * h_dec_seg is not fused, so the dd() at the end of the group
+             * loop applies the un-delta as usual. */
+            if(gs >= (1u<<20))       hrc = h_dec_seg(&p,edd,gp,gs);
+            else if(stride==1 && orders[g]==1 && lag_idx==0){
                 hrc = h_dec_p(&p,edd,gp,gs,1);       /* fused prefix sum */
                 fused[g] = 1;
             }
-            else if(gs >= (1u<<20)) hrc = h_dec_seg(&p,edd,gp,gs);
             else                     hrc = h_dec(&p,edd,gp,gs);
             if(hrc<0){if(stride>1)free(trans);return-1;}
         }

@@ -276,6 +276,44 @@ int main(void) {
         CHK(legacy_ok > 0, "a block labelled with the old wrong inner stride still decodes");
     }
 
+    printf("[c12] Huffman segments: a 1MiB+ group at order 1 / lag 0\n");
+    /* The encoder switches to four independent Huffman tables at 1MiB per
+     * group.  The decoder tested the fused single-table path (stride 1,
+     * order 1, lag 0) first, so exactly those groups were decoded with the
+     * wrong parser: usually an error, but when the misread length came out
+     * zero the decode reported success with nothing written, which the hex
+     * wrapper turned into a zero-byte "success".  Both shapes below are hex
+     * dumps that fold to just over 1MiB with a constant prefix, which keeps
+     * segmentation off and leaves one group. */
+    {
+        static const char *const tails[] = {"BBBBBBBBB\n", "CCCCCCCCCC\n"};
+        static const size_t sizes[] = {882166, 915352};
+        int ok_all = 1, hit_hex = 0, ok = 1;
+        for (int k = 0; k < 2 && ok_all; k++) {
+            size_t n = sizes[k], o = 0;
+            uint8_t *in = malloc(n + 64);
+            if (!in) { ok_all = 0; break; }
+            memset(in, 'A', 4096); o = 4096;
+            size_t tl = strlen(tails[k]);
+            while (o + tl <= n) { memcpy(in + o, tails[k], tl); o += tl; }
+            while (o < n) in[o++] = 'D';
+            size_t mc = cpenc_max_compressed_size(o);
+            uint8_t *c = malloc(mc), *out = malloc(o);
+            ok = c && out;
+            for (int ord = 0; ord <= 4 && ok; ord++) {
+                size_t cl = mc, dl = o;
+                if (cpenc_compress(in, o, c, &cl, ord) != 0) { ok = 0; break; }
+                if (c[3] == 0xFE) hit_hex++;
+                if (cpenc_decompress(c, cl, out, &dl) != 0 || dl != o ||
+                    memcmp(out, in, o)) ok = 0;
+            }
+            if (!ok) ok_all = 0;
+            free(in); free(c); free(out);
+        }
+        CHK(ok_all, "a 1MiB+ group at order 1 / lag 0 round-trips");
+        CHK(hit_hex > 0, "the hex wrapper was actually exercised at that size");
+    }
+
     printf("[c10] v7 BWT2: anchored LF chains + RLE2 round-trip\n");
     /* Stride 0xF9 is the BWT candidate the encoder now emits: BWT, k stored
      * LF anchors, MTF, RLE2, then the inner Huffman block.  Source-like text
