@@ -2467,7 +2467,16 @@ static int cpenc_compress_core(const void *sv, size_t sl, void *dv, size_t *dl,
         }
         hdr_put((uint8_t*)d, hex_mode ? CPENC_STRIDE_HEX : CPENC_STRIDE_RAW,
                 (uint32_t)sl,(uint32_t)(ext+sl));
-        if(hex_mode) d[CPENC_HEADER_SIZE]=(uint8_t)stride;
+        /* The payload below is `s` copied verbatim — no stride transpose, no
+         * delta — so the inner stride is RAW, whatever stride ds() picked
+         * before the groups failed.  Writing the picked stride here told the
+         * decoder to parse folded hex as [lag][orders][8 groups]: every block
+         * that reached this branch (hex text whose folded bytes are ~random
+         * but whose header and separator table pull the whole-block entropy
+         * under 7.9) came back as a decode failure.  The near-random branch
+         * above has always written CPENC_STRIDE_RAW; this one did not, from
+         * the v4 hex layer until now. */
+        if(hex_mode) d[CPENC_HEADER_SIZE]=CPENC_STRIDE_RAW;
         d[CPENC_HEADER_SIZE+ext-1]=(uint8_t)lag_idx;
         memcpy(d+CPENC_HEADER_SIZE+ext,s,sl);*dl=CPENC_HEADER_SIZE+ext+sl;
         free(trial);free(trans);free(lagbuf);free(hexbuf);return 0;
@@ -3193,7 +3202,20 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         uint8_t *tmp = malloc(blk ? blk : 1);
         if(!tmp){ free(ns); return -1; }
         size_t tdl = blk;
-        if(cpenc_decompress(ns, sl, tmp, &tdl) != 0){ free(ns); free(tmp); return -1; }
+        if(cpenc_decompress(ns, sl, tmp, &tdl) != 0){
+            /* Compatibility with blocks written before the encoder fix: the
+             * "all groups incompressible" fast path copied the folded bytes
+             * out verbatim but recorded the stride ds() had picked (1..8)
+             * instead of RAW, so the payload is a RAW stream wearing a
+             * stride-(1..8) header.  The layout is otherwise identical — the
+             * lag byte is in the same place — so retry as RAW once.  A block
+             * that really was stride-coded decodes on the first attempt and
+             * never reaches this. */
+            if(!(rs >= 1 && rs <= 8)){ free(ns); free(tmp); return -1; }
+            ((CPEncHeader*)ns)->stride = CPENC_STRIDE_RAW;
+            tdl = blk;
+            if(cpenc_decompress(ns, sl, tmp, &tdl) != 0){ free(ns); free(tmp); return -1; }
+        }
         free(ns);
         if(tdl < 13){ free(tmp); return -1; }
         uint32_t orig_len = (uint32_t)tmp[0] | ((uint32_t)tmp[1]<<8) | ((uint32_t)tmp[2]<<16) | ((uint32_t)tmp[3]<<24);

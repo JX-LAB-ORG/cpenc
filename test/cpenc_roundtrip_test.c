@@ -211,6 +211,71 @@ int main(void) {
         CHK(ok, "9 hex digits per line round-trips");
     }
 
+    printf("[c11] hex text whose folded bytes are near-random (global RAW fast path)\n");
+    /* The hex wrapper compresses the folded bytes as an inner stream and
+     * records its real stride in a byte between the two headers.  The
+     * "every group is incompressible" fast path copies the folded bytes out
+     * verbatim, so the inner stride there is RAW — but it wrote the stride
+     * ds() had picked before the groups failed (1..8).  Any hex block that
+     * folded to ~random bytes yet kept the whole-block entropy under 7.9 (the
+     * 13-byte header and the separator table are enough to do that) decoded
+     * as [lag][orders][8 groups] and failed outright: 32 uppercase characters
+     * per line being the shape that was reported.  Every order failed, and
+     * the block was simply unreadable rather than wrong. */
+    {
+        int hit_raw_hex = 0, legacy_ok = 0, all_ok = 1;
+        static const char hd[] = "0123456789ABCDEF";
+        for (int width = 32; width <= 50; width += 18) {
+            /* Reproducible pseudo-random bytes, hex-encoded: exactly the
+             * content that folds into something incompressible. */
+            size_t bytes = 6900, n = 0;
+            int col = 0;
+            uint8_t *in = malloc(bytes * 2 + bytes / 8 + 64);
+            if (!in) { all_ok = 0; break; }
+            uint64_t st = 1;
+            for (size_t i = 0; i < bytes; i++) {
+                st = st * 6364136223846793005ULL + 1442695040888963407ULL;
+                uint8_t v = (uint8_t)(st >> 33);
+                in[n++] = (uint8_t)hd[v >> 4];
+                in[n++] = (uint8_t)hd[v & 15];
+                col += 2;
+                if (col >= width && i + 1 < bytes) { in[n++] = '\n'; col = 0; }
+            }
+            size_t mc = cpenc_max_compressed_size(n);
+            uint8_t *c = malloc(mc), *out = malloc(n);
+            int ok = c && out;
+            if (ok) {
+                size_t cl = mc, dl = n;
+                for (int ord = 0; ord <= 4 && ok; ord++) {
+                    cl = mc;
+                    if (cpenc_compress(in, n, c, &cl, ord) != 0) { ok = 0; break; }
+                    /* The test has to prove it is exercising hex mode at all,
+                     * and the raw fast path inside it. */
+                    if (c[3] == 0xFE && cl > 13 && c[12] == 0xFF) hit_raw_hex++;
+                    dl = n;
+                    if (cpenc_decompress(c, cl, out, &dl) != 0 || dl != n ||
+                        memcmp(out, in, n)) ok = 0;
+                    /* Blocks already written by the old encoder: the payload
+                     * is this same RAW stream, only the inner stride byte
+                     * says 1..8.  The decoder retries those as RAW, so an
+                     * old container is still readable. */
+                    if (c[3] == 0xFE && c[12] == 0xFF) {
+                        c[12] = 2;
+                        dl = n;
+                        if (cpenc_decompress(c, cl, out, &dl) != 0 || dl != n ||
+                            memcmp(out, in, n)) ok = 0;
+                        legacy_ok++;
+                    }
+                }
+            }
+            if (!ok) all_ok = 0;
+            free(in); free(c); free(out);
+        }
+        CHK(all_ok, "hex text with near-random folded bytes round-trips");
+        CHK(hit_raw_hex > 0, "the hex+RAW fast path was actually exercised");
+        CHK(legacy_ok > 0, "a block labelled with the old wrong inner stride still decodes");
+    }
+
     printf("[c10] v7 BWT2: anchored LF chains + RLE2 round-trip\n");
     /* Stride 0xF9 is the BWT candidate the encoder now emits: BWT, k stored
      * LF anchors, MTF, RLE2, then the inner Huffman block.  Source-like text
