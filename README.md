@@ -91,6 +91,11 @@ int  cpenc_decompress(src, cap, dst, &n);       /* 0 on success; dst_len: capaci
 
 - `order` (0–4): search effort. 0 is fastest, 4 gives the best ratio; libcfs
   uses 2.
+- The output buffer must be `cpenc_max_compressed_size(n)` bytes. That is a
+  contract, not a hint: the encoder builds and measures candidate layouts
+  before it picks one, so a buffer sized to "what the last run produced" can
+  be refused with -1 even though the final stream would have fit. Every
+  caller in libcfs sizes its buffers this way.
 - **Blocks are independent**: decompressing block k needs no earlier block.
   That is where random access comes from.
 - **Deterministic**: the same input and the same `order` produce identical

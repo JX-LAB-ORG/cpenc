@@ -54,16 +54,33 @@ typedef struct {
 /* ─── Public API ──────────────────────────────────────────────── */
 
 /* Compress src_len bytes from src into dst.
- * dst_len: [in] size of dst buffer, [out] actual compressed size.
+ *
+ * Buffer contract: `*dst_len` is the capacity on input, and it must be at
+ * least cpenc_max_compressed_size(src_len).  That bound is what the encoder
+ * is written against; a smaller buffer is refused with -1 even when the
+ * stream that would eventually be produced fits, because the encoder builds
+ * and measures candidate layouts (stride, delta, BWT, reference, hex) before
+ * it picks one, and those need the worst-case room.  "Exactly as large as
+ * the last output for this input" is therefore not a valid size.
+ *
+ * dst_len: [in] capacity, [out] compressed size on success.
  * max_order: 0-4, smaller = faster but lower ratio. Tier1 uses 2, Tier2 uses 4.
- * Returns 0 on success, -1 if dst buffer too small, -2 on error. */
+ * Returns 0 on success, -1 if the buffer is below the contract or the result
+ * does not fit, -2 if src_len exceeds what one block can describe
+ * (0xFFFFFFFF). */
 int cpenc_compress(const void *src, size_t src_len,
                    void *dst, size_t *dst_len,
                    int max_order);
 
 /* Decompress src_len bytes from src into dst.
+ *
+ * dst must have room for the whole original block: a decode is not
+ * incremental, and the size in the stream's header is what the caller has to
+ * have believed when it sized the buffer.
+ *
  * dst_len: [in] size of dst buffer, [out] actual decompressed size.
- * Returns 0 on success, -1 if dst too small or data corrupt. */
+ * Returns 0 on success, -1 if dst is too small or the stream is corrupt or
+ * not self-consistent, -2 if an internal allocation failed. */
 int cpenc_decompress(const void *src, size_t src_len,
                      void *dst, size_t *dst_len);
 
