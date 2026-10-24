@@ -34,6 +34,81 @@ static int rt(const uint8_t *in, size_t n) {
     return ok;
 }
 
+/* ── datasets for the stride matrix in [c14] ────────────────────────
+ * Each seeds rng_state itself so the matrix does not depend on what the
+ * earlier tests consumed.  The sizes were measured: the encoder commits to
+ * the named stride for each of these. */
+static void gen_random(uint8_t *b, size_t n) {
+    rng_state = 0xC0FFEE;
+    for (size_t i = 0; i < n; i++) b[i] = (uint8_t)(rnd() & 0xFF);
+}
+static void gen_hexdump(uint8_t *b, size_t n) {
+    static const char h[] = "0123456789ABCDEF";
+    rng_state = 0x12345;
+    for (size_t i = 0; i < n; i++)
+        b[i] = (i % 33 == 32) ? '\n' : (uint8_t)h[rnd() & 15];
+}
+/* high byte a slow ramp, low byte random: two very different statistics in
+ * one block, which is what makes the encoder split it into segments */
+static void gen_plane(uint8_t *b, size_t n) {
+    rng_state = 0x2222;
+    for (size_t i = 0; i + 1 < n; i += 2) {
+        b[i] = (uint8_t)((i / 2) / 16);
+        b[i + 1] = (uint8_t)(rnd() & 0xFF);
+    }
+    if (n & 1) b[n - 1] = 0;
+}
+/* source-like text with a wide identifier vocabulary: BWT2 territory */
+static void gen_source(uint8_t *b, size_t n) {
+    static const char *syl[] = {
+        "ka","to","ri","men","sa","lo","vin","dra","pe","qu",
+        "an","el","or","ist","ure","con","ter","pre","dis","tion"
+    };
+    rng_state = 0xC0FFEE;
+    size_t o = 0;
+    while (o < n) {
+        char name[64], line[160];
+        size_t k = 0;
+        for (int w = 0; w < 3 && k < sizeof name - 8; w++) {
+            const char *s = syl[rnd() % 20];
+            while (*s && k < sizeof name - 1) name[k++] = *s++;
+        }
+        name[k] = 0;
+        for (char *p = name; *p; p++) if (rnd() & 1) *p = (char)(*p - 'a' + 'A');
+        int len = snprintf(line, sizeof line, "#define %s %lu\n",
+                           name, (unsigned long)(rnd() % 99999));
+        size_t take = (size_t)len;
+        if (take > n - o) take = n - o;
+        memcpy(b + o, line, take);
+        o += take;
+    }
+}
+/* a fixed log template repeated: the reference layer's long exact matches */
+static void gen_log(uint8_t *b, size_t n) {
+    static const char l[] = "2026-10-16 ERROR something failed with code 42\n";
+    for (size_t i = 0; i < n; i++) b[i] = (uint8_t)l[i % (sizeof l - 1)];
+}
+/* fixed-width records, a small pool of keys: REF2's columnar shape */
+static void gen_kv(uint8_t *b, size_t n) {
+    rng_state = 0x999;
+    size_t i = 0;
+    while (i + 32 <= n) {
+        uint32_t k = rnd() % 64;
+        memcpy(b + i, &k, 4); memcpy(b + i + 4, &k, 4);
+        memset(b + i + 8, 0, 24);
+        i += 32;
+    }
+    while (i < n) b[i++] = 0;
+}
+/* a u32 counter table: the plain stride path (ds picks stride 1) */
+static void gen_u32table(uint8_t *b, size_t n) {
+    for (size_t i = 0; i + 3 < n; i += 4) {
+        uint32_t v = (uint32_t)(i / 4) * 7u;
+        b[i] = (uint8_t)v; b[i+1] = (uint8_t)(v >> 8);
+        b[i+2] = (uint8_t)(v >> 16); b[i+3] = (uint8_t)(v >> 24);
+    }
+}
+
 int main(void) {
     printf("[c1] boundary sizes roundtrip\n");
     size_t sizes[] = {1, 2, 3, 7, 15, 16, 31, 32, 63, 64, 65, 127, 128, 129,
@@ -474,6 +549,187 @@ int main(void) {
             free(in); free(bw); free(ref); free(out);
         }
         CHK(ok, "k-chain LF walk matches serial bwt_dec (k=8,16; 4 sizes)");
+    }
+
+    printf("[c14] v8 CRC: one payload bit flip is refused for every stride\n");
+    /* Before v8 there was no check over the payload: a bit flip that still
+     * decoded to the declared length was returned as different bytes.  Each
+     * case below compresses real data until the encoder picks the named
+     * stride, asserts the emitted block is v8, then flips one bit in the
+     * middle of the compressed payload and requires a refusal.  The bit sits
+     * after the 12-byte header and before the 4-byte trailer, so it is data,
+     * not structure.  Every stride the encoder can emit is covered:
+     * 0xFF RAW, 0xFE HEX, 0xFD SEG, 0xFC BWT (built by hand: the encoder no
+     * longer prefers MTF-only over BWT2, but the format and its decoder are
+     * still live), 0xF9 BWT2, 0xFB REF, 0xFA REF2, and the plain 1..8 path. */
+    {
+        /* The generators are defined just before main(); each one here is a
+         * dataset measured to make the encoder commit to the named stride. */
+        static const struct { const char *nm; uint8_t want; size_t n; int mo;
+                              void (*fn)(uint8_t *, size_t); } tab[] = {
+            {"RAW (0xFF)",   CPENC_STRIDE_RAW,  65536,   2, gen_random },
+            {"HEX (0xFE)",   CPENC_STRIDE_HEX,  131072,  2, gen_hexdump},
+            {"SEG (0xFD)",   CPENC_STRIDE_SEG,  1048576, 2, gen_plane  },
+            {"BWT2 (0xF9)",  CPENC_STRIDE_BWT2, 65536,   2, gen_source },
+            {"REF (0xFB)",   CPENC_STRIDE_REF,  262144,  2, gen_log    },
+            {"REF2 (0xFA)",  CPENC_STRIDE_REF2, 262144,  2, gen_kv     },
+            {"plain stride", 1,                 131072,  2, gen_u32table },
+        };
+        int ok_all = 1;
+        size_t maxn = 0;
+        for (size_t k = 0; k < sizeof tab / sizeof tab[0]; k++)
+            if (tab[k].n > maxn) maxn = tab[k].n;
+        uint8_t *in = malloc(maxn);
+        uint8_t *out = malloc(maxn);
+        if (!in || !out) ok_all = 0;
+        for (size_t k = 0; ok_all && k < sizeof tab / sizeof tab[0]; k++) {
+            size_t n = tab[k].n;
+            tab[k].fn(in, n);
+            size_t mc = cpenc_max_compressed_size(n);
+            uint8_t *c = malloc(mc);
+            size_t cl = mc;
+            if (!c || cpenc_compress(in, n, c, &cl, tab[k].mo) != 0) {
+                fprintf(stderr, "  FAIL %s: compress\n", tab[k].nm); ok_all = 0;
+            } else if (c[2] != CPENC_VERSION) {
+                fprintf(stderr, "  FAIL %s: version %u, want %u\n", tab[k].nm, c[2], CPENC_VERSION);
+                ok_all = 0;
+            } else if (c[3] != tab[k].want) {
+                fprintf(stderr, "  FAIL %s: encoder picked stride 0x%02X, want 0x%02X\n",
+                        tab[k].nm, c[3], tab[k].want);
+                ok_all = 0;
+            } else {
+                size_t dl = n;
+                if (cpenc_decompress(c, cl, out, &dl) != 0 || dl != n ||
+                    memcmp(out, in, n)) {
+                    fprintf(stderr, "  FAIL %s: honest round-trip\n", tab[k].nm);
+                    ok_all = 0;
+                } else {
+                    /* One flipped bit in the payload body (not header, not
+                     * trailer: for a block at least 20 bytes the midpoint
+                     * lies in [12, cl-4)). */
+                    size_t off = CPENC_HEADER_SIZE + (cl - CPENC_HEADER_SIZE) / 2;
+                    c[off] ^= 0x01;
+                    dl = n;
+                    if (cpenc_decompress(c, cl, out, &dl) == 0)
+                        { fprintf(stderr, "  FAIL %s: payload flip accepted\n", tab[k].nm); ok_all = 0; }
+                    c[off] ^= 0x01;
+                    /* And the trailer itself is covered: corrupting one of
+                     * its bits must be refused too. */
+                    c[cl - 1] ^= 0x80;
+                    dl = n;
+                    if (cpenc_decompress(c, cl, out, &dl) == 0)
+                        { fprintf(stderr, "  FAIL %s: trailer flip accepted\n", tab[k].nm); ok_all = 0; }
+                    c[cl - 1] ^= 0x80;
+                }
+            }
+            free(c);
+        }
+
+        /* BWT (0xFC): the encoder now prefers BWT2 whenever RLE2 does not
+         * expand, so this stride has to be assembled from its published
+         * format: [primary index u32][inner cpenc block], where the inner
+         * block compresses BWT+MTF of the original.  The trailer is the CRC
+         * of the ORIGINAL bytes, and the encoder writes that same value for
+         * any v8 block over this input — borrow it from a normal encode
+         * instead of duplicating the CRC implementation in this test. */
+        if (ok_all) {
+            size_t n = 65536;
+            gen_source(in, n);
+            uint8_t *bw = malloc(n + 1);
+            uint8_t *inner = malloc(cpenc_max_compressed_size(n + 1));
+            size_t icap = cpenc_max_compressed_size(n + 1);
+            uint8_t *ref = malloc(cpenc_max_compressed_size(n));
+            size_t refcl = cpenc_max_compressed_size(n);
+            if (!bw || !inner || !ref ||
+                cpenc_compress(in, n, ref, &refcl, 2) != 0) ok_all = 0;
+            else {
+                size_t oi = bwt_enc(in, n, bw);
+                mtf_enc_inplace(bw, n + 1);
+                size_t icl = icap;
+                if (cpenc_compress(bw, n + 1, inner, &icl, 2) != 0) ok_all = 0;
+                else {
+                    size_t cl = CPENC_HEADER_SIZE + 4 + icl + 4;
+                    uint8_t *c = calloc(1, cl);
+                    if (!c) ok_all = 0;
+                    else {
+                        c[0] = (uint8_t)(CPENC_MAGIC & 0xFF);
+                        c[1] = (uint8_t)(CPENC_MAGIC >> 8);
+                        c[2] = CPENC_VERSION;
+                        c[3] = CPENC_STRIDE_BWT;
+                        uint32_t comp = (uint32_t)(4 + icl + 4);
+                        c[4]=(uint8_t)n; c[5]=(uint8_t)(n>>8); c[6]=(uint8_t)(n>>16); c[7]=(uint8_t)(n>>24);
+                        c[8]=(uint8_t)comp; c[9]=(uint8_t)(comp>>8); c[10]=(uint8_t)(comp>>16); c[11]=(uint8_t)(comp>>24);
+                        c[12]=(uint8_t)oi; c[13]=(uint8_t)(oi>>8); c[14]=(uint8_t)(oi>>16); c[15]=(uint8_t)(oi>>24);
+                        memcpy(c + 16, inner, icl);
+                        memcpy(c + cl - 4, ref + refcl - 4, 4);   /* CRC over in */
+                        size_t dl = n;
+                        if (cpenc_decompress(c, cl, out, &dl) != 0 || dl != n ||
+                            memcmp(out, in, n)) {
+                            fprintf(stderr, "  FAIL BWT (0xFC): honest round-trip\n"); ok_all = 0;
+                        } else {
+                            size_t off = CPENC_HEADER_SIZE + 4 + icl / 2;   /* inner payload */
+                            c[off] ^= 0x01;
+                            dl = n;
+                            if (cpenc_decompress(c, cl, out, &dl) == 0)
+                                { fprintf(stderr, "  FAIL BWT (0xFC): payload flip accepted\n"); ok_all = 0; }
+                        }
+                        free(c);
+                    }
+                }
+            }
+            free(bw); free(inner); free(ref);
+        }
+        CHK(ok_all, "every stride refuses a flipped payload bit (v8)");
+        free(in); free(out);
+
+        /* The trailer is a standard CRC-32 over the original bytes: pin the
+         * definition and byte order with the canonical check vector, so a
+         * future table or endianness change cannot silently keep passing. */
+        {
+            static const uint8_t v[9] = {'1','2','3','4','5','6','7','8','9'};
+            size_t mc = cpenc_max_compressed_size(sizeof v);
+            uint8_t *c = malloc(mc);
+            size_t cl = mc;
+            int okv = c && cpenc_compress(v, sizeof v, c, &cl, 2) == 0 &&
+                      cl >= CPENC_HEADER_SIZE + 4 &&
+                      c[cl-4] == 0x26 && c[cl-3] == 0x39 &&
+                      c[cl-2] == 0xF4 && c[cl-1] == 0xCB;
+            CHK(okv, "trailer is CRC32(\"123456789\") = 0xCBF43926, little-endian");
+            free(c);
+        }
+    }
+
+    printf("[c15] v7 compatibility: CPENC_V7=1 writes a trailer-less block\n");
+    {
+        uint8_t *in = malloc(131072), *out = malloc(131072);
+        int ok_all = in && out;
+        if (ok_all) {
+            gen_source(in, 131072);
+            setenv("CPENC_V7", "1", 1);
+            size_t mc = cpenc_max_compressed_size(131072);
+            uint8_t *c = malloc(mc);
+            size_t cl = mc;
+            if (!c || cpenc_compress(in, 131072, c, &cl, 2) != 0) ok_all = 0;
+            else {
+                /* v7 shape: no trailer, compressed_size is exactly the
+                 * payload length, and the reader must still accept it. */
+                uint32_t comp = (uint32_t)c[8] | ((uint32_t)c[9] << 8) |
+                                ((uint32_t)c[10] << 16) | ((uint32_t)c[11] << 24);
+                if (c[2] != 7) { fprintf(stderr, "  FAIL: version %u, want 7\n", c[2]); ok_all = 0; }
+                if (cl != (size_t)comp + CPENC_HEADER_SIZE) {
+                    fprintf(stderr, "  FAIL: v7 block carries extra bytes\n"); ok_all = 0;
+                }
+                size_t dl = 131072;
+                if (ok_all && (cpenc_decompress(c, cl, out, &dl) != 0 ||
+                               dl != 131072 || memcmp(out, in, 131072))) {
+                    fprintf(stderr, "  FAIL: v7 block did not decode\n"); ok_all = 0;
+                }
+            }
+            unsetenv("CPENC_V7");
+            free(c);
+        }
+        CHK(ok_all, "a v7 block written by the new encoder still decodes");
+        free(in); free(out);
     }
 
     printf("\n=== %d failures ===\n", failed);

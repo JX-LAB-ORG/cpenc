@@ -7,9 +7,9 @@
 extern "C" {
 #endif
 
-/* ─── CPEnc block header (12 + stride bytes) ─────────────────── */
+/* ─── CPEnc block header (12 + stride bytes + optional CRC) ──── */
 #define CPENC_MAGIC   0x4350   /* 'CP' */
-#define CPENC_VERSION 7        /* what each version added:
+#define CPENC_VERSION 8        /* what each version added:
                                 * v2: stride remainder bytes in stream;
                                 * v3: 1 lag byte before orders (lag delta);
                                 * v4: stride 0xFE = hex-ascii to binary layer;
@@ -17,7 +17,16 @@ extern "C" {
                                 * v6: stride 0xFC = BWT layer and 0xFB/0xFA =
                                 *     reference layers (repeats);
                                 * v7: stride 0xF9 = BWT with stored LF anchors
-                                *     and RLE2; 0xFC still decodes */
+                                *     and RLE2; 0xFC still decodes;
+                                * v8: a 4-byte CRC32 trailer (little-endian)
+                                *     follows the stride payload.  The CRC is
+                                *     over the ORIGINAL (pre-compression) bytes
+                                *     this block reconstructs; compressed_size
+                                *     includes the trailer.  Every nested block
+                                *     carries its own.  A v8 block with a
+                                *     missing or mismatched CRC is refused.
+                                *     v1-v7 blocks have no trailer and decode
+                                *     without verification. */
 #define CPENC_STRIDE_RAW 0xFF  /* RAW passthrough stride */
 #define CPENC_STRIDE_HEX 0xFE  /* hex-ascii text: 2:1 to binary + sep table */
 #define CPENC_STRIDE_SEG 0xFD  /* segmented: per-segment lag+stride */
@@ -46,10 +55,13 @@ typedef struct {
     uint8_t  version;         /* 1 */
     uint8_t  stride;          /* 1/2/4/8 or 0xFF = RAW */
     uint32_t original_size;
-    uint32_t compressed_size; /* total after header, including per-group tANS tables */
+    uint32_t compressed_size; /* total after header, including per-group tANS
+                               * tables and, for v8, the 4-byte CRC trailer */
 } CPEncHeader;
 #define CPENC_HEADER_SIZE 12
-/* After the 12-byte header, there are 'stride' uint8_t order values */
+/* After the 12-byte header, there are 'stride' uint8_t order values.
+ * A v8 block ends with a 4-byte little-endian CRC32 of the reconstructed
+ * original bytes; it lies at header + compressed_size - 4. */
 
 /* ─── Public API ──────────────────────────────────────────────── */
 
@@ -86,6 +98,12 @@ int cpenc_decompress(const void *src, size_t src_len,
 
 /* Quick estimate of max compressed size needed (worst case). */
 size_t cpenc_max_compressed_size(size_t src_len);
+
+/* CRC-32 (IEEE) of a buffer — the same function the v8 trailer uses.  Exposed
+ * so a caller that builds a block by hand (libcfs does, for RAW payloads it
+ * already has in memory) can produce a valid v8 block instead of a header
+ * that claims v8 and carries no checksum. */
+uint32_t cpenc_crc32(const void *p, size_t n);
 
 #ifdef __cplusplus
 }

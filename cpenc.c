@@ -40,6 +40,80 @@ static inline void hdr_put(uint8_t *p, uint8_t stride, uint32_t orig, uint32_t c
     hdr_comp(p, comp);
 }
 
+/* ── v8 payload integrity ────────────────────────────────────────
+ * CRC-32 (IEEE 802.3, reflected polynomial 0xEDB88320) over the ORIGINAL
+ * bytes a block reconstructs, stored as a 4-byte little-endian trailer.
+ *
+ * Why over the original and not the compressed bytes: it verifies the whole
+ * pipeline in one compare.  A flip in the compressed payload, in a stride
+ * table, in an outer wrapper's own fields (BWT primary index, RLE2
+ * boundaries, SEG length table), or a wrong-mode decode that happens to
+ * produce the declared length all end in the same place — different output
+ * bytes — and all are caught.  Verifying the compressed bytes would catch
+ * only the first of those, and would need the payload length to be correct
+ * before it could even be located.
+ *
+ * The table is a literal (not lazily built): the encoder runs segments on
+ * several threads, and a lazy table would need a lock or once-init on the
+ * hot path.  It was generated from the reflected polynomial and checked
+ * against the standard vector CRC32_IEEE("123456789") == 0xCBF43926. */
+static const uint32_t crc32_tab[256] = {
+    0x00000000u, 0x77073096u, 0xEE0E612Cu, 0x990951BAu, 0x076DC419u, 0x706AF48Fu, 0xE963A535u, 0x9E6495A3u,
+    0x0EDB8832u, 0x79DCB8A4u, 0xE0D5E91Eu, 0x97D2D988u, 0x09B64C2Bu, 0x7EB17CBDu, 0xE7B82D07u, 0x90BF1D91u,
+    0x1DB71064u, 0x6AB020F2u, 0xF3B97148u, 0x84BE41DEu, 0x1ADAD47Du, 0x6DDDE4EBu, 0xF4D4B551u, 0x83D385C7u,
+    0x136C9856u, 0x646BA8C0u, 0xFD62F97Au, 0x8A65C9ECu, 0x14015C4Fu, 0x63066CD9u, 0xFA0F3D63u, 0x8D080DF5u,
+    0x3B6E20C8u, 0x4C69105Eu, 0xD56041E4u, 0xA2677172u, 0x3C03E4D1u, 0x4B04D447u, 0xD20D85FDu, 0xA50AB56Bu,
+    0x35B5A8FAu, 0x42B2986Cu, 0xDBBBC9D6u, 0xACBCF940u, 0x32D86CE3u, 0x45DF5C75u, 0xDCD60DCFu, 0xABD13D59u,
+    0x26D930ACu, 0x51DE003Au, 0xC8D75180u, 0xBFD06116u, 0x21B4F4B5u, 0x56B3C423u, 0xCFBA9599u, 0xB8BDA50Fu,
+    0x2802B89Eu, 0x5F058808u, 0xC60CD9B2u, 0xB10BE924u, 0x2F6F7C87u, 0x58684C11u, 0xC1611DABu, 0xB6662D3Du,
+    0x76DC4190u, 0x01DB7106u, 0x98D220BCu, 0xEFD5102Au, 0x71B18589u, 0x06B6B51Fu, 0x9FBFE4A5u, 0xE8B8D433u,
+    0x7807C9A2u, 0x0F00F934u, 0x9609A88Eu, 0xE10E9818u, 0x7F6A0DBBu, 0x086D3D2Du, 0x91646C97u, 0xE6635C01u,
+    0x6B6B51F4u, 0x1C6C6162u, 0x856530D8u, 0xF262004Eu, 0x6C0695EDu, 0x1B01A57Bu, 0x8208F4C1u, 0xF50FC457u,
+    0x65B0D9C6u, 0x12B7E950u, 0x8BBEB8EAu, 0xFCB9887Cu, 0x62DD1DDFu, 0x15DA2D49u, 0x8CD37CF3u, 0xFBD44C65u,
+    0x4DB26158u, 0x3AB551CEu, 0xA3BC0074u, 0xD4BB30E2u, 0x4ADFA541u, 0x3DD895D7u, 0xA4D1C46Du, 0xD3D6F4FBu,
+    0x4369E96Au, 0x346ED9FCu, 0xAD678846u, 0xDA60B8D0u, 0x44042D73u, 0x33031DE5u, 0xAA0A4C5Fu, 0xDD0D7CC9u,
+    0x5005713Cu, 0x270241AAu, 0xBE0B1010u, 0xC90C2086u, 0x5768B525u, 0x206F85B3u, 0xB966D409u, 0xCE61E49Fu,
+    0x5EDEF90Eu, 0x29D9C998u, 0xB0D09822u, 0xC7D7A8B4u, 0x59B33D17u, 0x2EB40D81u, 0xB7BD5C3Bu, 0xC0BA6CADu,
+    0xEDB88320u, 0x9ABFB3B6u, 0x03B6E20Cu, 0x74B1D29Au, 0xEAD54739u, 0x9DD277AFu, 0x04DB2615u, 0x73DC1683u,
+    0xE3630B12u, 0x94643B84u, 0x0D6D6A3Eu, 0x7A6A5AA8u, 0xE40ECF0Bu, 0x9309FF9Du, 0x0A00AE27u, 0x7D079EB1u,
+    0xF00F9344u, 0x8708A3D2u, 0x1E01F268u, 0x6906C2FEu, 0xF762575Du, 0x806567CBu, 0x196C3671u, 0x6E6B06E7u,
+    0xFED41B76u, 0x89D32BE0u, 0x10DA7A5Au, 0x67DD4ACCu, 0xF9B9DF6Fu, 0x8EBEEFF9u, 0x17B7BE43u, 0x60B08ED5u,
+    0xD6D6A3E8u, 0xA1D1937Eu, 0x38D8C2C4u, 0x4FDFF252u, 0xD1BB67F1u, 0xA6BC5767u, 0x3FB506DDu, 0x48B2364Bu,
+    0xD80D2BDAu, 0xAF0A1B4Cu, 0x36034AF6u, 0x41047A60u, 0xDF60EFC3u, 0xA867DF55u, 0x316E8EEFu, 0x4669BE79u,
+    0xCB61B38Cu, 0xBC66831Au, 0x256FD2A0u, 0x5268E236u, 0xCC0C7795u, 0xBB0B4703u, 0x220216B9u, 0x5505262Fu,
+    0xC5BA3BBEu, 0xB2BD0B28u, 0x2BB45A92u, 0x5CB36A04u, 0xC2D7FFA7u, 0xB5D0CF31u, 0x2CD99E8Bu, 0x5BDEAE1Du,
+    0x9B64C2B0u, 0xEC63F226u, 0x756AA39Cu, 0x026D930Au, 0x9C0906A9u, 0xEB0E363Fu, 0x72076785u, 0x05005713u,
+    0x95BF4A82u, 0xE2B87A14u, 0x7BB12BAEu, 0x0CB61B38u, 0x92D28E9Bu, 0xE5D5BE0Du, 0x7CDCEFB7u, 0x0BDBDF21u,
+    0x86D3D2D4u, 0xF1D4E242u, 0x68DDB3F8u, 0x1FDA836Eu, 0x81BE16CDu, 0xF6B9265Bu, 0x6FB077E1u, 0x18B74777u,
+    0x88085AE6u, 0xFF0F6A70u, 0x66063BCAu, 0x11010B5Cu, 0x8F659EFFu, 0xF862AE69u, 0x616BFFD3u, 0x166CCF45u,
+    0xA00AE278u, 0xD70DD2EEu, 0x4E048354u, 0x3903B3C2u, 0xA7672661u, 0xD06016F7u, 0x4969474Du, 0x3E6E77DBu,
+    0xAED16A4Au, 0xD9D65ADCu, 0x40DF0B66u, 0x37D83BF0u, 0xA9BCAE53u, 0xDEBB9EC5u, 0x47B2CF7Fu, 0x30B5FFE9u,
+    0xBDBDF21Cu, 0xCABAC28Au, 0x53B39330u, 0x24B4A3A6u, 0xBAD03605u, 0xCDD70693u, 0x54DE5729u, 0x23D967BFu,
+    0xB3667A2Eu, 0xC4614AB8u, 0x5D681B02u, 0x2A6F2B94u, 0xB40BBE37u, 0xC30C8EA1u, 0x5A05DF1Bu, 0x2D02EF8Du,
+};
+uint32_t cpenc_crc32(const void *p, size_t n) {
+    const uint8_t *b = p;
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++)
+        c = crc32_tab[(c ^ b[i]) & 0xFF] ^ (c >> 8);
+    return c ^ 0xFFFFFFFFu;
+}
+/* Payload length (bytes after the 12-byte header, excluding a v8 trailer).
+ * compressed_size always counted "everything after the header", so the only
+ * translation a v8 block needs is dropping the 4 trailer bytes. */
+static inline size_t cpenc_payload_len(const CPEncHeader *h) {
+    return h->version >= 8 ? (size_t)h->compressed_size - 4
+                           : (size_t)h->compressed_size;
+}
+static inline uint32_t ld32le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+static inline void st32le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
 #define HUFF_MAX 12
 #define HUFF_WSZ (1<<HUFF_MAX)
 
@@ -1965,7 +2039,9 @@ static size_t rle2_mtf_dec(const uint8_t *in, size_t m, uint8_t *out, size_t n) 
    ═══════════════════════════════════════════════════════════════ */
 
 size_t cpenc_max_compressed_size(size_t sl) {
-    return CPENC_HEADER_SIZE+16+sl+sl/2+16384;
+    /* ... + 4 for the v8 CRC trailer.  The encoder reserves those 4 bytes
+     * before it runs, so the body still sees exactly the old budget. */
+    return CPENC_HEADER_SIZE+16+sl+sl/2+16384+4;
 }
 
 /* v7: the BWT2 inner call needs the main path with the lag-delta
@@ -1976,12 +2052,49 @@ size_t cpenc_max_compressed_size(size_t sl) {
  * already tuned to skip.  `no_lag` is the only difference; every other
  * caller (including the recursive ones inside) goes through the unchanged
  * 7-argument entry point, so no existing path changes behaviour. */
-static int cpenc_compress_core(const void *sv, size_t sl, void *dv, size_t *dl,
+static int cpenc_compress_body(const void *sv, size_t sl, void *dv, size_t *dl,
                                int mo, int no_bwt, int no_lz, int no_lag);
+/* v8 wrapper: run the encoder body with 4 bytes reserved at the end, then
+ * append the CRC32 trailer over the ORIGINAL input and fold those 4 bytes
+ * into compressed_size.  Every success path of the body (and every nested
+ * call, since they re-enter through cpenc_compress_impl) lands here, so one
+ * place owns the trailer and no branch can forget it.
+ *
+ * Reserving the trailer from `*dl` keeps the body's arithmetic identical to
+ * v7: its buffer contract was measured against cpenc_max_compressed_size(),
+ * which grew by exactly 4, so the room it sees is unchanged.  Candidate
+ * size comparisons inside the body are also unchanged: a candidate and the
+ * main path both omit the (same) outer trailer, and the nested blocks they
+ * carry already include their own.
+ *
+ * CPENC_V7=1 (compatibility testing) leaves the stream at version 7 with no
+ * trailer, which every reader since v1 accepts.  It is read per call rather
+ * than cached so a test can toggle it inside one process. */
+static int cpenc_compress_core(const void *sv, size_t sl, void *dv, size_t *dl,
+                               int mo, int no_bwt, int no_lz, int no_lag) {
+    int v7 = getenv("CPENC_V7") != NULL;
+    if (*dl < 4) return -1;
+    size_t room = v7 ? *dl : *dl - 4;
+    size_t bl = room;
+    int rc = cpenc_compress_body(sv, sl, dv, &bl, mo, no_bwt, no_lz, no_lag);
+    if (rc != 0) return rc;
+    if (bl < CPENC_HEADER_SIZE || bl > room) return -1;
+    uint8_t *d = (uint8_t *)dv;
+    if (v7) {
+        d[2] = 7;                       /* hdr_head wrote CPENC_VERSION */
+        *dl = bl;
+        return 0;
+    }
+    d[2] = CPENC_VERSION;
+    hdr_comp(d, (uint32_t)(bl - CPENC_HEADER_SIZE + 4));
+    st32le(d + bl, cpenc_crc32(sv, sl));
+    *dl = bl + 4;
+    return 0;
+}
 int cpenc_compress_impl(const void *sv, size_t sl, void *dv, size_t *dl, int mo, int no_bwt, int no_lz) {
     return cpenc_compress_core(sv, sl, dv, dl, mo, no_bwt, no_lz, 0);
 }
-static int cpenc_compress_core(const void *sv, size_t sl, void *dv, size_t *dl,
+static int cpenc_compress_body(const void *sv, size_t sl, void *dv, size_t *dl,
                                int mo, int no_bwt, int no_lz, int no_lag) {
     lg2_init();
     const uint8_t *s=(const uint8_t*)sv; uint8_t *d=(uint8_t*)dv;
@@ -3046,6 +3159,7 @@ static __thread const void *g_rb[CPENC_MAX_NEST];
 static __thread size_t      g_rn[CPENC_MAX_NEST];
 static __thread int         g_rd;
 
+static int cpenc_decompress_body(const void *sv, size_t sl, void *dv, size_t *dl);
 static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl);
 
 int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
@@ -3077,6 +3191,30 @@ int cpenc_decompress(const void *sv, size_t sl, void *dv, size_t *dl) {
 }
 
 static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl) {
+    int rc = cpenc_decompress_body(sv, sl, dv, dl);
+    if (rc != 0) return rc;
+    /* v8 integrity check, in one place for every stride.  The body has
+     * already reconstructed the ORIGINAL bytes into dst (that is what all
+     * branches promise), so verifying here covers payload flips, table
+     * flips, wrapper-field flips and wrong-mode decodes alike, and it is
+     * O(original_size) — one pass over the output, the same size the caller
+     * asked to be produced.  RAW is included: its "payload" is the data and
+     * this runs immediately after the copy/lag-restore.
+     *
+     * compressed_size is untrusted too.  Requiring 4 <= compressed_size <=
+     * sl - 12 places the trailer entirely inside the caller's buffer before
+     * a byte of it is read; anything else is a malformed v8 block. */
+    if (sl < CPENC_HEADER_SIZE) return -1;
+    const uint8_t *s = (const uint8_t *)sv;
+    if (s[2] < 8) return 0;                 /* v1-v7: no trailer, no check */
+    uint32_t comp = ld32le(s + 8);
+    if (comp < 4 || (size_t)comp > sl - CPENC_HEADER_SIZE) return -1;
+    uint32_t want = ld32le(s + CPENC_HEADER_SIZE + comp - 4);
+    if (cpenc_crc32(dv, *dl) != want) return -1;
+    return 0;
+}
+
+static int cpenc_decompress_body(const void *sv, size_t sl, void *dv, size_t *dl) {
     const uint8_t *s=(const uint8_t*)sv; uint8_t *d=(uint8_t*)dv;
     if(sl<CPENC_HEADER_SIZE) return -1;
     /* Copy the header out rather than casting: the API takes const void*, so
@@ -3097,6 +3235,15 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
      * a corrupt field — and every subsequent bounds check inside would be
      * arithmetic on a pointer that far out of range. */
     if(sl > (size_t)CPENC_MAX_BLOCK + 64) return -1;
+    /* v8: compressed_size describes the payload plus the 4-byte CRC
+     * trailer, so it must leave room for the trailer inside the buffer the
+     * caller actually supplied.  Established once, here, so cpenc_payload_len
+     * cannot underflow and no branch has to repeat it.  The trailer's VALUE
+     * is checked by the wrapper after the output exists. */
+    if (h->version >= 8 &&
+        (h->compressed_size < 4 ||
+         (size_t)h->compressed_size > sl - CPENC_HEADER_SIZE))
+        return -1;
     /* Every stride except HEX and SEG produces exactly h->original_size bytes,
      * so the caller's capacity can be checked once, here, rather than trusting
      * each branch to remember.  BWT2 (0xF9) is in that flat group: it emits
@@ -3217,11 +3364,32 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         if(!ns) return -1;
         memcpy(ns, s, sl);
         ((CPEncHeader*)ns)->stride = (uint8_t)rs;
-        memmove(ns + CPENC_HEADER_SIZE, ns + CPENC_HEADER_SIZE + 1, sl - CPENC_HEADER_SIZE - 1);
+        size_t inner_len;
+        if (h->version >= 8) {
+            /* Outer v8 layout: [hdr][rs][inner stride payload][outer CRC].
+             * The synthetic inner block is [hdr][inner stride payload]; the
+             * 4-byte trailer at the end belongs to the TEXT this wrapper
+             * restores, not to the folded buffer, so it stays outside the
+             * inner block.  Its version is set to 7 to tell the recursive
+             * decoder there is no inner trailer to verify (the outer check
+             * covers these bytes through the restored text). */
+            size_t plen = cpenc_payload_len(h);      /* 1 + stride payload */
+            if (plen < 1) { free(ns); return -1; }
+            inner_len = CPENC_HEADER_SIZE + plen - 1;
+            memmove(ns + CPENC_HEADER_SIZE, ns + CPENC_HEADER_SIZE + 1, plen - 1);
+            ((CPEncHeader*)ns)->version = 7;
+            ((CPEncHeader*)ns)->compressed_size = (uint32_t)(plen - 1);
+        } else {
+            /* Legacy layout: compressed_size counts the rs byte and there is
+             * no trailer; the one-byte-short buffer is what every v4-v7
+             * block has always produced, so keep it byte for byte. */
+            inner_len = sl;
+            memmove(ns + CPENC_HEADER_SIZE, ns + CPENC_HEADER_SIZE + 1, sl - CPENC_HEADER_SIZE - 1);
+        }
         uint8_t *tmp = malloc(blk ? blk : 1);
         if(!tmp){ free(ns); return -1; }
         size_t tdl = blk;
-        if(cpenc_decompress(ns, sl, tmp, &tdl) != 0){
+        if(cpenc_decompress(ns, inner_len, tmp, &tdl) != 0){
             /* Compatibility with blocks written before the encoder fix: the
              * "all groups incompressible" fast path copied the folded bytes
              * out verbatim but recorded the stride ds() had picked (1..8)
@@ -3233,7 +3401,7 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
             if(!(rs >= 1 && rs <= 8)){ free(ns); free(tmp); return -1; }
             ((CPEncHeader*)ns)->stride = CPENC_STRIDE_RAW;
             tdl = blk;
-            if(cpenc_decompress(ns, sl, tmp, &tdl) != 0){ free(ns); free(tmp); return -1; }
+            if(cpenc_decompress(ns, inner_len, tmp, &tdl) != 0){ free(ns); free(tmp); return -1; }
         }
         free(ns);
         if(tdl < 13){ free(tmp); return -1; }
@@ -3306,7 +3474,7 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         if(sl < CPENC_HEADER_SIZE+4) return -1;
         const uint8_t *rp = s + CPENC_HEADER_SIZE;
         uint32_t oi=(uint32_t)rp[0]|((uint32_t)rp[1]<<8)|((uint32_t)rp[2]<<16)|((uint32_t)rp[3]<<24);
-        size_t pl = h->compressed_size - 4;
+        size_t pl = cpenc_payload_len(h) - 4;
         if(pl > (size_t)(sl - CPENC_HEADER_SIZE - 4)) return -1;
         /* Redundant with the entry check above, and kept on purpose: this is
          * the branch that lost it once, and the memcpy at the end writes
@@ -3339,7 +3507,7 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
          * inner header all come off disk. */
         if(sl < CPENC_HEADER_SIZE + 1 + 4) return -1;
         const uint8_t *rp = s + CPENC_HEADER_SIZE;
-        size_t pl = h->compressed_size;
+        size_t pl = cpenc_payload_len(h);
         if(pl > (size_t)(sl - CPENC_HEADER_SIZE)) return -1;
         unsigned k = rp[0];
         if(k < 8 || k > 16) return -1;           /* the format's own range */
@@ -3415,7 +3583,7 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
          * a header claiming more than the block holds made the inner decode
          * read past the end (fuzzing caught it; REF2 already had this check
          * and REF did not). */
-        size_t pln = h->compressed_size;
+        size_t pln = cpenc_payload_len(h);
         if(pln > (size_t)(sl - CPENC_HEADER_SIZE) || pln < CPENC_HEADER_SIZE) return -1;
         uint32_t tn = (uint32_t)rp[4] | ((uint32_t)rp[5]<<8) |
                       ((uint32_t)rp[6]<<16) | ((uint32_t)rp[7]<<24);
@@ -3441,7 +3609,7 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
         if(sl < CPENC_HEADER_SIZE + REF2_HDR) return -1;
         if(*dl < h->original_size) return -1;
         const uint8_t *pl = s + CPENC_HEADER_SIZE;
-        size_t pln = h->compressed_size;
+        size_t pln = cpenc_payload_len(h);
         if(pln > (size_t)(sl - CPENC_HEADER_SIZE) || pln < REF2_HDR) return -1;
         uint32_t tn = (uint32_t)pl[0] | ((uint32_t)pl[1]<<8) |
                       ((uint32_t)pl[2]<<16) | ((uint32_t)pl[3]<<24);
