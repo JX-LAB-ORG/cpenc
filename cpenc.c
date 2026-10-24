@@ -1598,12 +1598,31 @@ static uint32_t h_enc_seg(const uint8_t *d, size_t n, uint8_t *ob, size_t cap) {
     }
     return (uint32_t)(lp - ob);
 }
+/* ── One Huffman choice, three callers ────────────────────────────
+ * A group's Huffman payload is either a classical single table or four
+ * independent segments.  Nothing in the stream marks which: the size
+ * estimate, the encoder and the decoder all derive it from the group size.
+ * They have to derive it from the same function, because a disagreement is
+ * not a decode error — it is unreadable data, and it was silent when the
+ * misread length came out zero.  Keeping the constant in one place is the
+ * point of these two predicates. */
+static int huff_segmented(size_t n) { return n >= (1u << 20); }
+
+/* The fused decoder walks the Huffman tree and applies the un-delta in the
+ * same pass.  Only a classical, single-group, one-delta, no-lag stream has
+ * the shape it implements.  The !huff_segmented() term is not implied by the
+ * rest: it is there so that no future reordering of these tests can route a
+ * segmented stream into the fused decoder again. */
+static int huff_can_fuse(size_t n, int stride, int orders, int lag) {
+    return !huff_segmented(n) && stride == 1 && orders == 1 && lag == 0;
+}
+
 /* Exact size of the Huffman payload emitted for a whole group: h_enc, or
  * h_enc_seg once the group crosses 1MB.  Computing the size from the code
  * lengths avoids an entropy estimate whose error (even 1%) is thousands of
  * bytes on an 8MB group. */
 static size_t huff_size_exact(const uint8_t *p, size_t n, const uint32_t fq[256]) {
-    if (n >= (1u << 20)) {
+    if (huff_segmented(n)) {
         size_t segn = (n + HUFF_SEGS - 1) / HUFF_SEGS;
         size_t total = 1 + 4 * HUFF_SEGS;
         for (int k = 0; k < HUFF_SEGS; k++) {
@@ -2729,7 +2748,7 @@ static int cpenc_compress_core(const void *sv, size_t sl, void *dv, size_t *dl,
             if(enc_bc>0)*out++=(uint8_t)(enc_buf&0xFF);
         }else if(tag==2){
             uint32_t used;
-            if(gs >= (1u<<20))
+            if(huff_segmented(gs))
                 used = h_enc_seg(gp, gs, out, (size_t)(edd-out));
             else {
                 uint8_t lens[256];uint16_t code[256];uint8_t bits[256];
@@ -3804,8 +3823,8 @@ static int cpenc_decompress_impl(const void *sv, size_t sl, void *dv, size_t *dl
              * "0 bytes decompressed, no error" — silent whole-block loss.
              * h_dec_seg is not fused, so the dd() at the end of the group
              * loop applies the un-delta as usual. */
-            if(gs >= (1u<<20))       hrc = h_dec_seg(&p,edd,gp,gs);
-            else if(stride==1 && orders[g]==1 && lag_idx==0){
+            if(huff_segmented(gs))   hrc = h_dec_seg(&p,edd,gp,gs);
+            else if(huff_can_fuse(gs, stride, orders[g], lag_idx)){
                 hrc = h_dec_p(&p,edd,gp,gs,1);       /* fused prefix sum */
                 fused[g] = 1;
             }

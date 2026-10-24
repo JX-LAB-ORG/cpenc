@@ -314,6 +314,69 @@ int main(void) {
         CHK(hit_hex > 0, "the hex wrapper was actually exercised at that size");
     }
 
+    printf("[c13] Huffman dispatch matrix across the 1MiB group boundary\n");
+    /* The stream does not record whether a group used one Huffman table or
+     * four; encoder, size estimate and decoder each derive it from the group
+     * size, and the decoder additionally folds the un-delta when the block is
+     * a single one-delta group.  The three must answer identically for every
+     * shape, so this walks sizes straddling the boundary with content that
+     * lands on different (stride, orders, lag) combinations. */
+    {
+        static const size_t edge[] = {(1u<<20)-2, (1u<<20)-1, (1u<<20),
+                                      (1u<<20)+1, (1u<<20)+3, 3u<<19, 5u<<19};
+        int ok_all = 1, cases = 0;
+        uint8_t *in = malloc(5u<<19), *out = malloc(5u<<19);
+        uint8_t *c = malloc(cpenc_max_compressed_size(5u<<19));
+        if (in && out && c) {
+            for (int e = 0; e < 7 && ok_all; e++)
+            for (int style = 0; style < 6 && ok_all; style++) {
+                size_t n = edge[e], o = 0;
+                uint32_t s = 12345u + (uint32_t)e * 977u + (uint32_t)style;
+                while (o < n) {
+                    switch (style) {
+                    case 0:  /* hex dump: folds to one dense group */
+                        in[o++] = "0123456789ABCDEF"[s & 15];
+                        s = s * 1103515245u + 12345u;
+                        if ((o % 33) == 32 && o + 1 < n) in[o++] = '\n';
+                        break;
+                    case 1:  /* raw pseudo-random bytes */
+                        s = s * 1103515245u + 12345u;
+                        in[o++] = (uint8_t)(s >> 24);
+                        break;
+                    case 2:  /* 16-byte records, one field changing: lag > 0 */
+                        in[o] = (uint8_t)("ABCDEFGHIJKLMNOP"[o % 16]);
+                        if ((o % 16) == 15) in[o] = (uint8_t)(o >> 8);
+                        o++;
+                        break;
+                    case 3:  /* long runs: RLE tags */
+                        memset(in + o, 'x', (o + 1000 < n) ? 1000 : (n - o));
+                        o += (o + 1000 < n) ? 1000 : (n - o);
+                        break;
+                    case 4:  /* plain text */
+                        in[o++] = (uint8_t)("the quick brown fox jumps over the lazy dog "[(o % 44)]);
+                        break;
+                    default: /* the reported shape: a constant 4096-byte prefix
+                              * then nine hex digits and a newline, which folds
+                              * to one dense group just over 1MiB */
+                        if (o < 4096) in[o++] = 'A';
+                        else in[o++] = ((o - 4096) % 10 == 9) ? '\n' : 'B';
+                        break;
+                    }
+                }
+                for (int ord = 0; ord <= 4; ord++) {
+                    size_t cl = cpenc_max_compressed_size(n), dl = n;
+                    cases++;
+                    if (cpenc_compress(in, n, c, &cl, ord) != 0 ||
+                        cpenc_decompress(c, cl, out, &dl) != 0 ||
+                        dl != n || memcmp(out, in, n)) ok_all = 0;
+                }
+            }
+        } else ok_all = 0;
+        free(in); free(out); free(c);
+        CHK(ok_all, "every shape round-trips either side of the 1MiB boundary");
+        printf("  (%d compressions)\n", cases);
+    }
+
     printf("[c10] v7 BWT2: anchored LF chains + RLE2 round-trip\n");
     /* Stride 0xF9 is the BWT candidate the encoder now emits: BWT, k stored
      * LF anchors, MTF, RLE2, then the inner Huffman block.  Source-like text
